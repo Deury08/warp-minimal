@@ -17,27 +17,27 @@ jobs:
           - goos: windows
             goarch: amd64
             ext: .exe
-            asset: warp-minimal_{{.Tag}}_windows_amd64.zip
+            artifact: warp-minimal
           - goos: windows
             goarch: arm64
             ext: .exe
-            asset: warp-minimal_{{.Tag}}_windows_arm64.zip
+            artifact: warp-minimal
           - goos: linux
             goarch: amd64
             ext: ""
-            asset: warp-minimal_{{.Tag}}_linux_amd64.tar.gz
+            artifact: warp-minimal
           - goos: linux
             goarch: arm64
             ext: ""
-            asset: warp-minimal_{{.Tag}}_linux_arm64.tar.gz
+            artifact: warp-minimal
           - goos: darwin
             goarch: amd64
             ext: ""
-            asset: warp-minimal_{{.Tag}}_darwin_amd64.tar.gz
+            artifact: warp-minimal
           - goos: darwin
             goarch: arm64
             ext: ""
-            asset: warp-minimal_{{.Tag}}_darwin_arm64.tar.gz
+            artifact: warp-minimal
     steps:
       - uses: actions/checkout@v4
 
@@ -52,21 +52,21 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          go build -ldflags="-s -w" -o warp-minimal${{ matrix.ext }} ./cmd/warp-minimal
-
-      - name: Package
-        run: |
+          out="warp-minimal${{ matrix.ext }}"
+          go build -ldflags="-s -w" -o "$out" ./cmd/warp-minimal
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            zip ${{ matrix.asset }} warp-minimal${{ matrix.ext }}
+            zip "${{ matrix.artifact }}_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" "$out"
           else
-            tar -czf ${{ matrix.asset }} warp-minimal${{ matrix.ext }}
+            tar -czf "${{ matrix.artifact }}_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" "$out"
           fi
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: ${{ matrix.artifact }}_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            warp-minimal_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+            warp-minimal_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
 
   release:
     needs: build
@@ -80,7 +80,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum * > checksums.txt
+          find . -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec sha256sum {} \; > checksums.txt
           cat checksums.txt
 
       - name: Create registry.json
@@ -111,8 +111,8 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/*/warp-minimal_${{ github.ref_name }}_*.zip
-            artifacts/*/warp-minimal_${{ github.ref_name }}_*.tar.gz
-            artifacts/*/checksums.txt
-            artifacts/*/registry.json
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+            artifacts/checksums.txt
+            artifacts/registry.json
           generate_release_notes: true
