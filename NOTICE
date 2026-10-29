@@ -1,0 +1,23 @@
+warp-minimal
+Copyright (c) 2026 Deury08
+
+This product includes components derived from or inspired by:
+
+1. Cloudflare WARP protocol (reverse-engineered from 1.1.1.1 client)
+   - Device registration API
+   - WireGuard configuration format
+   - Key derivation (HKDF-ChaCha20Poly1305)
+
+2. golang.zx2c4.com/wireguard
+   Copyright (c) 2017-2023 WireGuard Authors
+   Licensed under MIT License
+
+3. gvisor.dev/gvisor
+   Copyright 2018 The gVisor Authors
+   Licensed under Apache License 2.0
+
+4. github.com/refraction-networking/utls
+   Copyright (c) 2017-2023 The uTLS Authors
+   Licensed under MIT License
+
+All derived works retain their original licenses as noted above.

@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            asset: warp-minimal_{{.Tag}}_windows_amd64.zip
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+            asset: warp-minimal_{{.Tag}}_windows_arm64.zip
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            asset: warp-minimal_{{.Tag}}_linux_amd64.tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            asset: warp-minimal_{{.Tag}}_linux_arm64.tar.gz
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            asset: warp-minimal_{{.Tag}}_darwin_amd64.tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            asset: warp-minimal_{{.Tag}}_darwin_arm64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -ldflags="-s -w" -o warp-minimal${{ matrix.ext }} ./cmd/warp-minimal
+
+      - name: Package
+        run: |
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip ${{ matrix.asset }} warp-minimal${{ matrix.ext }}
+          else
+            tar -czf ${{ matrix.asset }} warp-minimal${{ matrix.ext }}
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create registry.json
+        run: |
+          cd artifacts
+          cat > registry.json <<REG
+          {
+            "version": "${{ github.ref_name }}",
+            "packages": [
+              {
+                "id": "warp-minimal",
+                "version": "${{ github.ref_name }}",
+                "platforms": {
+                  "windows_amd64": "warp-minimal_${{ github.ref_name }}_windows_amd64.zip",
+                  "windows_arm64": "warp-minimal_${{ github.ref_name }}_windows_arm64.zip",
+                  "linux_amd64": "warp-minimal_${{ github.ref_name }}_linux_amd64.tar.gz",
+                  "linux_arm64": "warp-minimal_${{ github.ref_name }}_linux_arm64.tar.gz",
+                  "darwin_amd64": "warp-minimal_${{ github.ref_name }}_darwin_amd64.tar.gz",
+                  "darwin_arm64": "warp-minimal_${{ github.ref_name }}_darwin_arm64.tar.gz"
+                }
+              }
+            ]
+          }
+          REG
+          cat registry.json
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/*/warp-minimal_${{ github.ref_name }}_*.zip
+            artifacts/*/warp-minimal_${{ github.ref_name }}_*.tar.gz
+            artifacts/*/checksums.txt
+            artifacts/*/registry.json
+          generate_release_notes: true
