@@ -63,21 +63,29 @@ func main() {
 	mux.HandleFunc(cfg.HealthPath, healthHandler(pool))
 	mux.HandleFunc("/", warp.ProxyHandler(pool))
 
+	// Wrap mux so CONNECT requests (not routed by ServeMux) reach the proxy.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			warp.ProxyHandler(pool)(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	server := &http.Server{
 		Addr:         cfg.Listen,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-
 
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("Shutdown signal received")
-		
+
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {

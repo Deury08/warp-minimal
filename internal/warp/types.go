@@ -3,7 +3,6 @@ package warp
 import (
 	"context"
 	"net"
-	"sync"
 	"time"
 )
 
@@ -33,24 +32,18 @@ func (e *Exit) DialContext(ctx context.Context, network, addr string) (net.Conn,
 	return e.tunnel.DialContext(ctx, network, addr)
 }
 
-type Tunnel struct {
-	mu       sync.Mutex
-	dialer   *net.Dialer
-	closed   bool
-}
-
 type PoolConfig struct {
 	PoolSize int
 	Stack    string
 }
 
 type WireGuardConfig struct {
-	PrivateKey     string
-	PeerPublicKey  string
-	Endpoint       string
-	ClientIPv4     string
-	ClientIPv6     string
-	Reserved       []int
+	PrivateKey   string
+	PeerPublicKey string
+	Endpoint      string
+	ClientIPv4   string
+	ClientIPv6   string
+	Reserved     []int
 }
 
 var (
