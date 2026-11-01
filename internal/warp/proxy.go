@@ -17,9 +17,10 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-// ProxyHandler creates an HTTP handler that forwards requests through WARP exits.
-// It handles both CONNECT (HTTPS tunneling) and regular HTTP proxy requests.
-func ProxyHandler(pool *Pool) http.HandlerFunc {
+// ProxyHandler crea un HTTP handler que reenvía requests a través de exits
+// WireGuard del pool. Maneja tanto CONNECT (tunelado HTTPS) como requests HTTP
+// normales de proxy.
+func ProxyHandler(pool *wgPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -43,8 +44,8 @@ func ProxyHandler(pool *Pool) http.HandlerFunc {
 	}
 }
 
-// handleConnect establishes a TCP tunnel through a WARP exit for HTTPS traffic.
-func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
+// handleConnect establece un túnel TCP a través de un exit WireGuard para tráfico HTTPS.
+func handleConnect(w http.ResponseWriter, r *http.Request, pool *wgPool) {
 	ctx := r.Context()
 
 	exit, err := pool.Acquire(ctx)
@@ -65,13 +66,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 
 	conn, err := exit.DialContext(ctx, "tcp", target)
 	if err != nil {
-		log.Printf("CONNECT %s: dial failed on exit %s: %v", target, exit.ID, err)
+		log.Printf("CONNECT %s: dial failed on exit %s: %v", target, exit.ID(), err)
 		http.Error(w, fmt.Sprintf("WARP dial failed: %v", err), http.StatusBadGateway)
 		pool.Fail(exit, err.Error())
 		return
 	}
 
-	// Signal successful tunnel establishment.
+	// Señal de establecimiento exitoso del túnel.
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		log.Printf("CONNECT %s: hijacking not supported", target)
@@ -90,9 +91,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 		return
 	}
 
-	// The http.Server read deadline (ReadTimeout) stays on the hijacked
-	// connection: after 30s it kills every long-lived stream (SSE) with a
-	// silent reset. Clear it — the relay manages its own lifetime.
+	// El read deadline del http.Server (ReadTimeout) permanece en la conexión
+	// hijacked: tras 30s mata cada stream long-lived (SSE) con un reset
+	// silencioso. Lo limpio — el relay gestiona su propia vida.
 	_ = clientConn.SetReadDeadline(time.Time{})
 	_ = clientConn.SetWriteDeadline(time.Time{})
 
@@ -103,8 +104,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 		return
 	}
 
-	// Relay with explicit read/write separation so client aborts (normal for
-	// SSE streams: the client cuts mid-body) never poison the exit.
+	// Relay con separación explícita de lectura/escritura para que abortos
+	// del cliente (normal para streams SSE: el cliente corta a mitad del
+	// body) nunca envenenen el exit.
 	stopRelay := func() func() {
 		var once sync.Once
 		closedFLG := make(chan struct{})
@@ -121,14 +123,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 	go func() {
 		buf := make([]byte, 8192)
 		for {
-			n, rerr := conn.Read(buf) // upstream read failure = tunnel issue
+			n, rerr := conn.Read(buf) // fallo de lectura upstream = problema de túnel
 			if rerr != nil {
 				t2cErrCh <- rerr
 				return
 			}
 			if n > 0 {
 				if _, werr := clientConn.Write(buf[:n]); werr != nil {
-					// client side died: abort the relay locally, keep the exit
+					// lado del cliente murió: abortar el relay localmente, mantener el exit
 					stopRelay()
 					t2cErrCh <- nil
 					return
@@ -136,10 +138,10 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 			}
 		}
 	}()
-	// Client -> tunnel: any read failure here is a LOCAL client problem.
+	// Cliente -> túnel: cualquier fallo de lectura aquí es un problema LOCAL del cliente.
 	io.Copy(conn, clientConn)
 	stopRelay()
-	// Give the upstream pump a beat to notice the closed sockets.
+	// Darle al pump upstream un respiro para que note los sockets cerrados.
 	select {
 	case upErr := <-t2cErrCh:
 		if upErr != nil && upErr != io.EOF && !errors.Is(upErr, net.ErrClosed) {
@@ -151,8 +153,8 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 	conn.Close()
 }
 
-// proxyRequest forwards a single HTTP request through a WARP exit.
-func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, exit *Exit) error {
+// proxyRequest reenvía un único request HTTP a través de un exit WireGuard.
+func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, exit *exitWG) error {
 	host := r.URL.Host
 	if !strings.Contains(host, ":") {
 		if r.URL.Scheme == "https" {
@@ -174,7 +176,7 @@ func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, e
 	return proxyHTTP(conn, r, w)
 }
 
-// bunClientHelloSpec returns the uTLS ClientHelloSpec mimicking Bun (JA4 t13d1713h1).
+// bunClientHelloSpec devuelve el ClientHelloSpec de uTLS mimificando Bun (JA4 t13d1713h1).
 func bunClientHelloSpec() *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS12,
@@ -192,7 +194,7 @@ func bunClientHelloSpec() *utls.ClientHelloSpec {
 		},
 		CompressionMethods: []uint8{0},
 		Extensions: []utls.TLSExtension{
-			&utls.SNIExtension{ServerName: ""}, // filled below per connection
+			&utls.SNIExtension{ServerName: ""}, // se llena por conexión
 			&utls.UtlsExtendedMasterSecretExtension{},
 			&utls.RenegotiationInfoExtension{Renegotiation: 1},
 			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
@@ -220,7 +222,7 @@ func bunClientHelloSpec() *utls.ClientHelloSpec {
 	}
 }
 
-// proxyHTTPS performs HTTPS proxy through the WARP exit using uTLS.
+// proxyHTTPS realiza proxy HTTPS a través del exit WireGuard usando uTLS.
 func proxyHTTPS(ctx context.Context, conn net.Conn, r *http.Request, w http.ResponseWriter) error {
 	tlsConn := utls.UClient(conn, &utls.Config{
 		ServerName:         r.URL.Hostname(),
@@ -229,7 +231,7 @@ func proxyHTTPS(ctx context.Context, conn net.Conn, r *http.Request, w http.Resp
 	}, utls.HelloCustom)
 
 	spec := bunClientHelloSpec()
-	// Fill in SNI per-request.
+	// Llenar SNI por request.
 	for i, ext := range spec.Extensions {
 		if sniExt, ok := ext.(*utls.SNIExtension); ok {
 			sniExt.ServerName = r.URL.Hostname()
@@ -246,13 +248,13 @@ func proxyHTTPS(ctx context.Context, conn net.Conn, r *http.Request, w http.Resp
 		return fmt.Errorf("uTLS handshake: %w", err)
 	}
 
-	// Forward the original request over the uTLS connection.
+	// Reenviar el request original sobre la conexión uTLS.
 	req := cloneRequest(r)
 	if err := req.Write(tlsConn); err != nil {
 		return fmt.Errorf("write request: %w", err)
 	}
 
-	// Read the upstream response and relay it to the client.
+	// Leer la respuesta upstream y reenviarla al cliente.
 	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
@@ -267,7 +269,7 @@ func proxyHTTPS(ctx context.Context, conn net.Conn, r *http.Request, w http.Resp
 	return nil
 }
 
-// proxyHTTP forwards a plain HTTP request through the WARP exit.
+// proxyHTTP reenvía un request HTTP plano a través del exit WireGuard.
 func proxyHTTP(conn net.Conn, r *http.Request, w http.ResponseWriter) error {
 	req := cloneRequest(r)
 	if err := req.Write(conn); err != nil {
@@ -288,7 +290,7 @@ func proxyHTTP(conn net.Conn, r *http.Request, w http.ResponseWriter) error {
 	return nil
 }
 
-// cloneRequest copies the incoming request, stripping hop-by-hop headers.
+// cloneRequest copia el request entrante, eliminando headers hop-by-hop.
 func cloneRequest(r *http.Request) *http.Request {
 	req := &http.Request{
 		Method:        r.Method,
@@ -335,7 +337,7 @@ func isHopByHop(k string) bool {
 	return strings.HasPrefix(k, "Proxy-") || strings.HasPrefix(k, "Te")
 }
 
-// copyHeaders copies all headers from src to dst, omitting hop-by-hop headers.
+// copyHeaders copia todos los headers de src a dst, omitiendo headers hop-by-hop.
 func copyHeaders(dst, src http.Header) {
 	for k, vv := range src {
 		if isHopByHop(k) {
