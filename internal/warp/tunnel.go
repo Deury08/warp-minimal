@@ -238,12 +238,27 @@ func tcpipAddrFromString(s string) (tcpip.Address, error) {
 // DialContext dials through the tunnel. network is Go's "tcp"/"udp" or
 // "tcp4"/"tcp6" style; hostnames are resolved with the host resolver, picking
 // an IPv6 first when the tunnel has a v6 client address.
+const dialTimeout = 30 * time.Second
+
 func (t *Tunnel) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	t.mu.Lock()
 	closed := t.closed
 	t.mu.Unlock()
 	if closed {
 		return nil, ErrTunnelClosed
+	}
+	// A dead or wedged netstack must not hold the caller forever: cap the
+	// dial so the pool can release the exit and request another.
+	if deadline, ok := ctx.Deadline(); ok {
+		if time.Until(deadline) > dialTimeout {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, dialTimeout)
+			defer cancel()
+		}
+	} else {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), dialTimeout)
+		defer cancel()
 	}
 
 	ap, err := t.resolveTarget(ctx, addr)

@@ -57,16 +57,38 @@ func (p *Pool) Acquire(ctx context.Context) (*Exit, error) {
 
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	deadline := time.After(15 * time.Second)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-deadline:
+			return nil, fmt.Errorf("no WARP exit available within 15s")
 		case <-ticker.C:
 			p.mu.Lock()
+			now := time.Now()
+			// Free exits held InUse for over 2 minutes: a live handler release
+			// happens in milliseconds, so this is a wedged dial/relay.
+			var wedged []*Exit
+			for _, e := range p.exits {
+				if e.InUse && e.InUseSince.Before(now.Add(-2*time.Minute)) {
+					log.Printf("WARP exit %s wedged in_use for %v: failing and replacing", e.ID[:8], now.Sub(e.InUseSince))
+					e.InUse = false
+					e.Cooldown = now.Add(cooldownDuration)
+					p.healthy--
+					p.coolingDown++
+					failed := e
+					wedged = append(wedged, failed)
+				}
+			}
+			for _, f := range wedged {
+				go func(fe *Exit) { p.replaceExit(fe) }(f)
+			}
 			for _, e := range p.exits {
 				if !e.InUse && e.Cooldown.IsZero() && e.Tunnel() != nil {
 					e.InUse = true
+					e.InUseSince = now
 					p.healthy--
 					p.mu.Unlock()
 					return e, nil
