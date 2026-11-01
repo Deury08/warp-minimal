@@ -180,6 +180,12 @@ func (p *Pool) createExit(ctx context.Context) (*Exit, error) {
 	}
 	exit.SetTunnel(tunnel)
 
+	// A dead MASQUE session must fail this exit immediately (auto-replace):
+	// otherwise requests queue on a zombie tunnel until the dial times out.
+	tunnel.SetOnDead(func(reason string) {
+		p.Fail(exit, reason)
+	})
+
 	return exit, nil
 }
 

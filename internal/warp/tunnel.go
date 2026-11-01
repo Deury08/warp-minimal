@@ -59,6 +59,11 @@ type Tunnel struct {
 
 	// masqueClose terminates the MASQUE session when set (WG path: nil).
 	masqueClose func()
+
+	// onDead notifies the owner (pool) when the MASQUE session dies, so the
+	// exit can be failed and replaced without waiting for a dial error.
+	onDeadMu sync.Once
+	onDead   func(reason string)
 }
 
 // WGLogHook, if set, receives every wireguard-go log line (verbose+errors).
@@ -457,4 +462,24 @@ func (t *Tunnel) Close() error {
 	t.ep.Close()
 	t.stack.Destroy()
 	return t.tfile.Close()
+}
+
+// SetOnDead registers the callback invoked exactly once when the tunnel dies.
+func (t *Tunnel) SetOnDead(fn func(reason string)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.onDead = fn
+}
+
+// markDead invokes the on-dead callback once, unless the tunnel was closed
+// intentionally (Close flows also produce read errors, not failures).
+func (t *Tunnel) markDead(reason string) {
+	t.mu.Lock()
+	fn := t.onDead
+	t.onDead = nil
+	closed := t.closed
+	t.mu.Unlock()
+	if fn != nil && !closed {
+		fn(reason)
+	}
 }

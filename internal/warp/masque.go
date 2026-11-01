@@ -194,14 +194,11 @@ func NewMasqueTunnel(ctx context.Context, cfg WireGuardConfig, endpoint string) 
 	// Inbound: masque datagrams -> netstack.
 	go func() {
 		buf := make([]byte, 65535)
-		nread := 0
 		for {
 			n, err := ipconn.ReadPacket(buf, true)
 			if err != nil {
-				nread++
-				if nread <= 3 {
-					log.Printf("masque: inbound read error (%d): %v", nread, err)
-				}
+				log.Printf("masque: session read ended: %v", err)
+				t.markDead("masque session: " + err.Error())
 				return
 			}
 			if n == 0 {
