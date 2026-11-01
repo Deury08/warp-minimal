@@ -101,11 +101,20 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 		_, err := io.Copy(clientConn, conn)
 		errCh <- err
 	}()
-	<-errCh
+	errA := <-errCh
+	errB := <-errCh
+	err = errB
+	if err == nil || err == io.EOF {
+		err = errA
+	}
 
+	// A tunnel closing is the NORMAL end of every CONNECT: never fail the
+	// exit for it. Only a mid-tunnel error indicates an unhealthy session.
+	if err != nil && err != io.EOF {
+		pool.Fail(exit, "tunnel relay error: "+err.Error())
+	}
 	clientConn.Close()
 	conn.Close()
-	pool.Fail(exit, "tunnel closed")
 }
 
 // proxyRequest forwards a single HTTP request through a WARP exit.
