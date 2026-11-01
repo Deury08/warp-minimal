@@ -49,7 +49,7 @@ func main() {
 		cfg.PoolSize = 2
 	}
 	if cfg.Stack == "" {
-		cfg.Stack = "ipv6"
+		cfg.Stack = "wireguard"
 	}
 	if cfg.HealthPath == "" {
 		cfg.HealthPath = "/health"
@@ -75,10 +75,11 @@ func main() {
 		log.Printf("ERROR: cannot open log file %s: %v (stdout only)", logPath, err)
 	}
 
-	pool, err := warp.NewPool(warp.PoolConfig{
+	reg := warp.NewWGRegistrar()
+	pool, err := warp.NewWGPool(warp.PoolConfig{
 		PoolSize: cfg.PoolSize,
 		Stack:    cfg.Stack,
-	})
+	}, reg)
 	if err != nil {
 		log.Fatalf("create warp pool: %v", err)
 	}
@@ -86,6 +87,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(cfg.HealthPath, healthHandler(pool))
+	mux.HandleFunc("/recycle", recycleHandler(pool))
 	mux.HandleFunc("/", warp.ProxyHandler(pool))
 
 	// Wrap mux so CONNECT requests (not routed by ServeMux) reach the proxy.
@@ -140,7 +142,7 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func healthHandler(pool *warp.Pool) http.HandlerFunc {
+func healthHandler(pool WGPoolStatuser) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		status := pool.Status()
@@ -148,4 +150,31 @@ func healthHandler(pool *warp.Pool) http.HandlerFunc {
 		status["service"] = "warp-minimal"
 		json.NewEncoder(w).Encode(status)
 	}
+}
+
+// recycleHandler re-enrolls the pool so every exit gets a fresh WARP egress
+// IP (the bridge calls this after persistent upstream 429s via warp).
+// Always async and idempotent: POST returns 202 with recycling=true both for
+// the call that starts the cycle and for any call that arrives while the
+// cycle is running, so repeated callers never duplicate enrollment work.
+func recycleHandler(pool WGPoolStatuser) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed; use POST", http.StatusMethodNotAllowed)
+			return
+		}
+		started, status := pool.RecycleAll()
+		log.Printf("recycle requested: started=%v", started)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		status["ok"] = started
+		status["recycling"] = true
+		json.NewEncoder(w).Encode(status)
+	}
+}
+
+// WGPoolStatuser es la interfaz que expone wgPool: Status y RecycleAll.
+type WGPoolStatuser interface {
+	Status() map[string]any
+	RecycleAll() (started bool, status map[string]any)
 }

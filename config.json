@@ -1,6 +1,6 @@
 {
   "listen": "127.0.0.1:8789",
   "pool_size": 2,
-  "stack": "ipv6",
+  "stack": "wireguard",
   "health_path": "/health"
 }
