@@ -86,6 +86,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 		return
 	}
 
+	// The http.Server read deadline (ReadTimeout) stays on the hijacked
+	// connection: after 30s it kills every long-lived stream (SSE) with a
+	// silent reset. Clear it — the relay manages its own lifetime.
+	_ = clientConn.SetReadDeadline(time.Time{})
+	_ = clientConn.SetWriteDeadline(time.Time{})
+
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		clientConn.Close()
 		conn.Close()

@@ -14,7 +14,8 @@ type Exit struct {
 	CreatedAt  time.Time
 	Cooldown   time.Time
 	InUse      bool
-	InUseSince time.Time // set when acquired; watchdog clears wedged holds
+	streams    int // active conns THROUGH the exit (shared; info only)
+	InUseSince time.Time
 	tunnel     *Tunnel
 }
 

@@ -49,58 +49,18 @@ func (p *Pool) Acquire(ctx context.Context) (*Exit, error) {
 
 	for _, e := range p.exits {
 		p.mu.Lock()
-		if !e.InUse && e.Cooldown.IsZero() && e.Tunnel() != nil {
-			e.InUse = true
+		// Exits are SHARED: a MASQUE tunnel is a full netstack host that
+		// carries any number of concurrent TCP flows, so an exit is
+		// available whenever it is healthy, regardless of other streams.
+		if e.Cooldown.IsZero() && e.Tunnel() != nil {
+			e.streams++
 			e.InUseSince = time.Now()
-			p.healthy--
 			p.mu.Unlock()
 			return e, nil
 		}
 		p.mu.Unlock()
 	}
-
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.After(15 * time.Second)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-deadline:
-			return nil, fmt.Errorf("no WARP exit available within 15s")
-		case <-ticker.C:
-			p.mu.Lock()
-			now := time.Now()
-			// Free exits held InUse for over 2 minutes: a live handler release
-			// happens in milliseconds, so this is a wedged dial/relay.
-			var wedged []*Exit
-			for _, e := range p.exits {
-				if e.InUse && e.InUseSince.Before(now.Add(-2*time.Minute)) {
-					log.Printf("WARP exit %s wedged in_use for %v: failing and replacing", e.ID[:8], now.Sub(e.InUseSince))
-					e.InUse = false
-					e.Cooldown = now.Add(cooldownDuration)
-					p.healthy--
-					p.coolingDown++
-					failed := e
-					wedged = append(wedged, failed)
-				}
-			}
-			for _, f := range wedged {
-				go func(fe *Exit) { p.replaceExit(fe) }(f)
-			}
-			for _, e := range p.exits {
-				if !e.InUse && e.Cooldown.IsZero() && e.Tunnel() != nil {
-					e.InUse = true
-					e.InUseSince = now
-					p.healthy--
-					p.mu.Unlock()
-					return e, nil
-				}
-			}
-			p.mu.Unlock()
-		}
-	}
+	return nil, fmt.Errorf("no WARP exit available (all cooling down or starting)")
 }
 
 func (p *Pool) Release(exit *Exit) {
@@ -109,9 +69,8 @@ func (p *Pool) Release(exit *Exit) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	exit.InUse = false
-	if exit.Cooldown.IsZero() {
-		p.healthy++
+	if exit.streams > 0 {
+		exit.streams--
 	}
 }
 
@@ -121,7 +80,7 @@ func (p *Pool) Fail(exit *Exit, reason string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	exit.InUse = false
+	exit.streams = 0
 	exit.Cooldown = time.Now().Add(cooldownDuration)
 	p.healthy--
 	p.coolingDown++
@@ -222,14 +181,15 @@ func (p *Pool) Status() map[string]any {
 	exits := make([]string, len(p.exits))
 	for i, e := range p.exits {
 		status := "healthy"
-		if e.InUse {
+		streams := e.streams
+		if streams > 0 {
 			status = "in_use"
 		} else if !e.Cooldown.IsZero() {
 			status = "cooldown"
 		} else if e.Tunnel() == nil {
 			status = "starting"
 		}
-		exits[i] = fmt.Sprintf("%s (%s)", e.ID[:8], status)
+		exits[i] = fmt.Sprintf("%s (%s, streams=%d)", e.ID[:8], status, streams)
 	}
 
 	return map[string]any{
