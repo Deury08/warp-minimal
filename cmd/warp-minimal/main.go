@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -16,10 +18,13 @@ import (
 )
 
 type Config struct {
-	Listen      string `json:"listen"`
-	PoolSize    int    `json:"pool_size"`
-	Stack       string `json:"stack"`
-	HealthPath  string `json:"health_path"`
+	Listen     string `json:"listen"`
+	PoolSize   int    `json:"pool_size"`
+	Stack      string `json:"stack"`
+	HealthPath string `json:"health_path"`
+	// LogPath forwards every log line (including exact failure details)
+	// to this file in addition to stdout. Appended, created if missing.
+	LogPath string `json:"log_path"`
 }
 
 func main() {
@@ -48,6 +53,26 @@ func main() {
 	}
 	if cfg.HealthPath == "" {
 		cfg.HealthPath = "/health"
+	}
+
+	// Persistent failure log: capture every diagnostic line (exact upstream
+	// errors, pool failures, tunnel state) to a file next to the binary so a
+	// dead console doesn't hide what failed. Default: warp-minimal.log next
+	// to the executable; override with log_path in the config.
+	logPath := cfg.LogPath
+	if logPath == "" {
+		if exe, err := os.Executable(); err == nil {
+			logPath = filepath.Join(filepath.Dir(exe), "warp-minimal.log")
+		} else {
+			logPath = "warp-minimal.log"
+		}
+	}
+	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		defer f.Close()
+		log.SetOutput(io.MultiWriter(os.Stderr, f))
+		log.Printf("logging to %s", logPath)
+	} else {
+		log.Printf("ERROR: cannot open log file %s: %v (stdout only)", logPath, err)
 	}
 
 	pool, err := warp.NewPool(warp.PoolConfig{

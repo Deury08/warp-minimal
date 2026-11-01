@@ -49,6 +49,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 
 	exit, err := pool.Acquire(ctx)
 	if err != nil {
+		log.Printf("CONNECT (no host): acquire failed: %v", err)
 		http.Error(w, fmt.Sprintf("WARP unavailable: %v", err), http.StatusServiceUnavailable)
 		return
 	}
@@ -64,6 +65,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 
 	conn, err := exit.DialContext(ctx, "tcp", target)
 	if err != nil {
+		log.Printf("CONNECT %s: dial failed on exit %s: %v", target, exit.ID, err)
 		http.Error(w, fmt.Sprintf("WARP dial failed: %v", err), http.StatusBadGateway)
 		pool.Fail(exit, err.Error())
 		return
@@ -72,6 +74,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 	// Signal successful tunnel establishment.
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
+		log.Printf("CONNECT %s: hijacking not supported", target)
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		conn.Close()
 		pool.Fail(exit, "hijacking not supported")
@@ -80,6 +83,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
+		log.Printf("CONNECT %s: hijack failed: %v", target, err)
 		http.Error(w, fmt.Sprintf("hijacking failed: %v", err), http.StatusInternalServerError)
 		conn.Close()
 		pool.Fail(exit, err.Error())
