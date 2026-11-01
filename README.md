@@ -1,6 +1,6 @@
 # warp-minimal
 
-> **Minimal WARP egress proxy** — Rotating IPv6 exits via **Cloudflare WARP MASQUE** (QUIC Connect-IP), zero GPL dependencies, works on DPI-filtered networks.
+> **Minimal WARP egress proxy** — Rotating exits via **Cloudflare WARP WireGuard** (userspace, UDP 2408), zero GPL dependencies, pool with preload and auto-rotation so tunnels don't drop under real traffic.
 
 [![Release](https://img.shields.io/github/v/release/Deury08/warp-minimal?label=latest)](https://github.com/Deury08/warp-minimal/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -15,13 +15,18 @@
 
 It has **zero dependencies on any specific project** — use it with any HTTP client.
 
-### Why MASQUE (and not WireGuard)?
+### Why WireGuard (UDP 2408)?
 
-Many ISPs (e.g. WISP / CGNAT access networks) apply DPI that drops generic
-WireGuard UDP handshakes. The official 1.1.1.1/WARP client solves this by
-tunneling over **QUIC + HTTP/3 CONNECT-IP (MASQUE, port 443)** — the same
-protocol `warp-minimal` implements since this release. WireGuard (`stack = wg`)
-remains available as a fallback where UDP 2408 works.
+WireGuard in userspace (no root, no TUN, no `NET_ADMIN`) gives a lean, stable
+egress with a persistent 25s keepalive that keeps the Cloudflare NAT mapping
+alive, so tunnels don't drop under real traffic. The pool preloads half its
+size (minimum 1 hot exit), rotates immediately on HTTP 429/403 or socket
+errors, and keeps each egress block (/64 IPv6 or /32 IPv4) in a 30-minute
+cooldown after a failure.
+
+Where an ISP blocks UDP 2408 (DPI on WireGuard handshakes), the old MASQUE
+(QUIC Connect-IP, UDP 443) path remains available by setting
+`"stack": "masque"` in `config.json`.
 
 ---
 
@@ -29,14 +34,16 @@ remains available as a fallback where UDP 2408 works.
 
 | Feature | Detail |
 |---------|--------|
-| **MASQUE egress** | Register → ECDSA P-256 enroll → QUIC/HTTP3 → CONNECT-IP, clean-room implementation |
-| **DPI-resistant** | QUIC datagrams on UDP 443; passes WISP DPI filters that kill WireGuard |
-| **IP rotation** | Pool of WARP exits (default 2), 30 min cooldown after 429 |
-| **Self-healing** | A dead MASQUE session fails its exit and is auto-replaced |
-| **Userspace** | No root, no TUN, no `NET_ADMIN` — quic-go + gVisor netstack |
+| **WireGuard egress (UDP 2408)** | Register → X25519 device (POST /reg, PATCH enable WARP) → userspace WG tunnel (wireguard-go + gVisor) |
+| **Pool with preload** | Half the pool (min 1) hot before first traffic; round-robin acquisition |
+| **Auto-rotation** | Immediate drop + background re-register on HTTP 429/403 or socket error |
+| **Cooldown per egress block** | 30 min per /64 IPv6 or /32 IPv4 after a failure |
+| **Persistent keepalive** | 25s so the Cloudflare NAT mapping stays alive under traffic |
+| **Self-healing** | A dead tunnel fails its exit and is auto-replaced |
+| **Userspace** | No root, no TUN, no `NET_ADMIN` — wireguard-go + gVisor netstack |
 | **TLS fingerprint** | uTLS with Bun ClientHello (JA4 `t13d1713h1`) to pass fingerprint gates |
 | **Health endpoint** | `GET /health` → JSON pool status |
-| **License** | **MIT** (deps: quic-go MIT, gVisor Apache-2.0, wireguard-go MIT, utls MIT) |
+| **License** | **MIT** (wireguard-go is MIT-like and compatible; only the WireGuard kernel module is GPLv2 and is NOT used) |
 
 ---
 
