@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	cooldownDuration   = 30 * time.Minute
+	cooldownDuration    = 30 * time.Minute
 	registrationTimeout = 30 * time.Second
-	maxRetries         = 3
-	retryDelay         = 5 * time.Second
+	maxRetries          = 3
+	retryDelay          = 5 * time.Second
 )
 
 type Pool struct {
@@ -165,9 +165,10 @@ func (p *Pool) createExit(ctx context.Context) (*Exit, error) {
 		return nil, fmt.Errorf("register device: %w", err)
 	}
 
-	tunnel, err := NewTunnel(ctx, cfg)
+	// MASQUE is the default egress (WireGuard is DPI-blocked on many ISPs).
+	tunnel, err := NewMasqueTunnel(ctx, cfg, "")
 	if err != nil {
-		return nil, fmt.Errorf("create tunnel: %w", err)
+		return nil, fmt.Errorf("create masque tunnel: %w", err)
 	}
 
 	exit := &Exit{
