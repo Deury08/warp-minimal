@@ -38,22 +38,25 @@ type PoolConfig struct {
 }
 
 type WireGuardConfig struct {
-	PrivateKey   string
+	PrivateKey    string
 	PeerPublicKey string
 	Endpoint      string
-	ClientIPv4   string
-	ClientIPv6   string
-	Reserved     []int
+	ClientIPv4    string
+	ClientIPv6    string
+	Reserved      []int
+	// MASQUE enrollment data (valid after RegisterDevice).
+	Token    string
+	DeviceID string
 }
 
 var (
-	ErrNotImplemented     = NewError("not implemented")
-	ErrWarpUnavailable    = NewError("WARP egress unavailable")
-	ErrNoTunnel           = NewError("no tunnel available")
-	ErrNoHealthyExit      = NewError("no healthy WARP exit available")
+	ErrNotImplemented  = NewError("not implemented")
+	ErrWarpUnavailable = NewError("WARP egress unavailable")
+	ErrNoTunnel        = NewError("no tunnel available")
+	ErrNoHealthyExit   = NewError("no healthy WARP exit available")
 )
 
 type warpError string
 
-func NewError(msg string) error { return warpError(msg) }
+func NewError(msg string) error   { return warpError(msg) }
 func (e warpError) Error() string { return string(e) }

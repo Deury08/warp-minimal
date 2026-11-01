@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"golang.org/x/crypto/curve25519"
@@ -18,8 +20,8 @@ import (
 
 const (
 	registrationURL   = "https://api.cloudflareclient.com/v0a2158/reg"
-	userAgent         = "okhttp/4.9.3"
-	cfClientVersion   = "6.23"
+	userAgent         = "WARP for Android"
+	cfClientVersion   = "a-6.35-4471"
 	hkdfSalt          = "cloudflare warp"
 	hkdfInfo          = "wireguard"
 	defaultPeerPublic = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
@@ -42,6 +44,8 @@ type registrationRequest struct {
 
 // registrationResponse matches the Cloudflare WARP registration API response.
 type registrationResponse struct {
+	ID      string `json:"id"`
+	Token   string `json:"token"`
 	Account struct {
 		PrivateKey string `json:"private_key"`
 		PublicKey  string `json:"public_key"`
@@ -55,7 +59,7 @@ type registrationResponse struct {
 			} `json:"endpoint"`
 		} `json:"peers"`
 		Interface struct {
-			Addresses map[string]string `json:"addresses"`
+			Addresses  map[string]string `json:"addresses"`
 			PrivateKey string            `json:"private_key"`
 		} `json:"interface"`
 	} `json:"config"`
@@ -82,7 +86,7 @@ func RegisterDevice(ctx context.Context) (WireGuardConfig, error) {
 		SerialNumber: generateSerialNumber(),
 		Locale:       "en_US",
 		WarpEnabled:  true,
-		Type:         "windows",
+		Type:         "Android",
 		AppVersion:   "6.23",
 		OsVersion:    "10.0.19045",
 	}
@@ -116,6 +120,10 @@ func RegisterDevice(ctx context.Context) (WireGuardConfig, error) {
 		return WireGuardConfig{}, fmt.Errorf("registration failed: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	if os.Getenv("WARP_DEBUG_REG") != "" {
+		fmt.Printf("WARP_REG_DEBUG: %s", respBody)
+		fmt.Println()
+	}
 	var regResp registrationResponse
 	if err := json.Unmarshal(respBody, &regResp); err != nil {
 		return WireGuardConfig{}, fmt.Errorf("parse registration response: %w", err)
@@ -133,12 +141,23 @@ func RegisterDevice(ctx context.Context) (WireGuardConfig, error) {
 		}
 	}
 
-	// Determine client IPv6 from interface addresses (map of ipv4/ipv6 -> CIDR).
+	// Client IPv4/IPv6 from interface addresses (map of v4/v6 -> CIDR).
+	clientIPv4 := ""
 	clientIPv6 := ""
-	for _, cidr := range regResp.Config.Interface.Addresses {
-		if strings.Contains(cidr, ":") {
-			clientIPv6 = strings.Split(cidr, "/")[0]
-			break
+	for key, cidr := range regResp.Config.Interface.Addresses {
+		ip := strings.Split(cidr, "/")[0]
+		switch key {
+		case "v4":
+			clientIPv4 = ip
+		case "v6":
+			clientIPv6 = ip
+		default:
+			if clientIPv6 == "" && strings.Contains(cidr, ":") {
+				clientIPv6 = ip
+			}
+			if clientIPv4 == "" && !strings.Contains(cidr, ":") {
+				clientIPv4 = ip
+			}
 		}
 	}
 
@@ -161,9 +180,9 @@ func RegisterDevice(ctx context.Context) (WireGuardConfig, error) {
 
 	derivedKey := hkdfDeriveKey(sharedSecret)
 
-	// Use first 4 bytes of derived key material as the WireGuard reserved bytes.
-	reserved := make([]int, 4)
-	for i := 0; i < 4 && i < len(derivedKey); i++ {
+	// Use first 3 bytes of derived key material as the WireGuard reserved bytes.
+	reserved := make([]int, 3)
+	for i := 0; i < 3 && i < len(derivedKey); i++ {
 		reserved[i] = int(derivedKey[i])
 	}
 
@@ -174,12 +193,98 @@ func RegisterDevice(ctx context.Context) (WireGuardConfig, error) {
 	}
 
 	return WireGuardConfig{
-		PrivateKey:   privateKeyB64,
+		PrivateKey:    privateKeyB64,
 		PeerPublicKey: peerPublicKey,
 		Endpoint:      endpoint,
+		ClientIPv4:    clientIPv4,
 		ClientIPv6:    clientIPv6,
 		Reserved:      reserved,
+		Token:         regResp.Token,
+		DeviceID:      regResp.ID,
 	}, nil
+}
+
+// enrollResponse carries the interface addresses Cloudflare assigns after
+// switching the device to MASQUE (they differ from the WireGuard ones).
+type enrollResponse struct {
+	Config struct {
+		Interface struct {
+			Addresses map[string]string `json:"addresses"`
+		} `json:"interface"`
+		Peers []struct {
+			Endpoint struct {
+				V4 string `json:"v4"`
+				V6 string `json:"v6"`
+			} `json:"endpoint"`
+			PublicKey string `json:"public_key"`
+		} `json:"peers"`
+	} `json:"config"`
+}
+
+// EnrollAndAddresses switches the registered device to the MASQUE tunnel type
+// (ECDSA P-256 key enrollment, mirroring the official client) and returns the
+// post-enrollment interface addresses.
+func EnrollAndAddresses(ctx context.Context, deviceID, token string, pubDER []byte) (string, string, string, string, error) {
+	payload, err := json.Marshal(struct {
+		Key     string `json:"key"`
+		KeyType string `json:"key_type"`
+		TunType string `json:"tunnel_type"`
+	}{Key: base64.StdEncoding.EncodeToString(pubDER), KeyType: "secp256r1", TunType: "masque"})
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("marshal enrollment: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch,
+		strings.Replace(registrationURL, "/reg", "/reg/"+deviceID, 1), bytes.NewReader(payload))
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("create enrollment request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Cf-Client-Version", cfClientVersion)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("PATCH enrollment: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", "", fmt.Errorf("enrollment failed: status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var enrollEnrollResponse enrollResponse
+	if err := json.Unmarshal(body, &enrollEnrollResponse); err != nil {
+		return "", "", "", "", fmt.Errorf("parse enrollment response: %w", err)
+	}
+	v6, v4 := "", ""
+	for key, cidr := range enrollEnrollResponse.Config.Interface.Addresses {
+		ip := strings.Split(cidr, "/")[0]
+		if key == "v6" || (v6 == "" && strings.Contains(cidr, ":")) {
+			v6 = ip
+		}
+		if key == "v4" || (v4 == "" && !strings.Contains(cidr, ":")) {
+			v4 = ip
+		}
+	}
+	// peer endpoint: v4 like "162.159.198.2/32", v6 like "[2606:4700:...]/64"
+	epV4, epV6, pin := "", "", ""
+	if len(enrollEnrollResponse.Config.Peers) > 0 {
+		peer := enrollEnrollResponse.Config.Peers[0]
+		// Endpoints arrive as "162.159.198.2:0" and "[2606:4700:103::2]:0".
+		epV4 = strings.TrimSuffix(peer.Endpoint.V4, ":0")
+		core := peer.Endpoint.V6
+		if strings.HasSuffix(core, ":0") {
+			core = core[:len(core)-2]
+		}
+		core = strings.TrimSuffix(core, "]")
+		core = strings.TrimPrefix(core, "[")
+		epV6 = core
+		pin = peer.PublicKey
+	}
+	log.Printf("masque enroll: v4=%q v6=%q endpoint_v4=%q endpoint_v6=%q pin=%d bytes", v4, v6, epV4, epV6, len(pin))
+	return v4, v6, epV4, epV6, nil
 }
 
 // generateSerialNumber produces a 16-character hex serial number.
