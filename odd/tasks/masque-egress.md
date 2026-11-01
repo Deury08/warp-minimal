@@ -27,3 +27,5 @@ Real Cloudflare WARP MASQUE tunnel (QUIC HTTP/3 Connect-IP) to replace the block
 - Prior context: WG tunnel built (tunnel.go, works off-network), ISP drops WG UDP (19 endpoints probed, 0 handshakes; official client works via MASQUE).
 
 - 2026-10-31: MASQUE egress verified live — trace warp=on, Google 200; commit on feat/masque-egress (single 1016-line slice; next unit commit split beyond it).
+
+- 2026-10-31: auto-replace on dead session (SetOnDead -> Pool.Fail) commit 32142f5; README updated with MASQUE protocol reference.
