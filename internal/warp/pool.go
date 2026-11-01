@@ -44,15 +44,19 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 }
 
 func (p *Pool) Acquire(ctx context.Context) (*Exit, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// NOTE: no defer-based unlock across the wait path — locking the same
+	// mutex twice (wait path re-locks) self-deadlocks the whole pool.
 
 	for _, e := range p.exits {
+		p.mu.Lock()
 		if !e.InUse && e.Cooldown.IsZero() && e.Tunnel() != nil {
 			e.InUse = true
+			e.InUseSince = time.Now()
 			p.healthy--
+			p.mu.Unlock()
 			return e, nil
 		}
+		p.mu.Unlock()
 	}
 
 	ticker := time.NewTicker(500 * time.Millisecond)
