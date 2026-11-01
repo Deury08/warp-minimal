@@ -265,7 +265,7 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 
 ## Changelog
 
-### v0.1.1 (unreleased / `feat/masque-egress`)
+### v0.1.1 (2026-10-31)
 - **Egress switched to MASQUE (QUIC Connect-IP) by default** — WireGuard falls back only if explicitly configured
 - Registration captured `id`+`token`; MASQUE enrollment (ECDSA P-256 key, PATCH)
 - Live endpoint from enrollment response; UA/CID/H3 settings replicated from the official client
