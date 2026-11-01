@@ -17,11 +17,13 @@ Real Cloudflare WARP MASQUE tunnel (QUIC HTTP/3 Connect-IP) to replace the block
 
 | ID | Spec | Work | Route | Commit |
 |----|------|------|-------|--------|
-| T1 | S2 | Registration: token/id capture + EC enrollment PATCH | inline | (pending) |
-| T2 | S2,S3 | masque.go: QUIC + connect-ip + netstack bridge | inline | (pending) |
-| T3 | S4 | wire pool to masque, build, live test | inline | (pending) |
+| T1 | S2 | Registration: token/id capture + EC enrollment PATCH | inline | (done, auto) |
+| T2 | S2,S3 | masque.go: QUIC + connect-ip + netstack bridge | inline | (done, auto) |
+| T3 | S4 | wire pool to masque, build, live test | inline | (done, auto) |
 
 ## Log
 
 - L1 (verbatim): "investigar el war real y sacar la logica faltante"
 - Prior context: WG tunnel built (tunnel.go, works off-network), ISP drops WG UDP (19 endpoints probed, 0 handshakes; official client works via MASQUE).
+
+- 2026-10-31: MASQUE egress verified live — trace warp=on, Google 200; commit on feat/masque-egress (single 1016-line slice; next unit commit split beyond it).
