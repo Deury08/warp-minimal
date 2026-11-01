@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -91,27 +93,49 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *Pool) {
 		return
 	}
 
-	// Relay bidirectionally until both sides close.
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(conn, clientConn)
-		errCh <- err
+	// Relay with explicit read/write separation so client aborts (normal for
+	// SSE streams: the client cuts mid-body) never poison the exit.
+	stopRelay := func() func() {
+		var once sync.Once
+		closedFLG := make(chan struct{})
+		go func() {
+			<-closedFLG
+			_ = clientConn.Close()
+			_ = conn.Close()
+		}()
+		return func() { once.Do(func() { close(closedFLG) }) }
 	}()
-	go func() {
-		_, err := io.Copy(clientConn, conn)
-		errCh <- err
-	}()
-	errA := <-errCh
-	errB := <-errCh
-	err = errB
-	if err == nil || err == io.EOF {
-		err = errA
-	}
+	defer stopRelay()
 
-	// A tunnel closing is the NORMAL end of every CONNECT: never fail the
-	// exit for it. Only a mid-tunnel error indicates an unhealthy session.
-	if err != nil && err != io.EOF {
-		pool.Fail(exit, "tunnel relay error: "+err.Error())
+	t2cErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			n, rerr := conn.Read(buf) // upstream read failure = tunnel issue
+			if rerr != nil {
+				t2cErrCh <- rerr
+				return
+			}
+			if n > 0 {
+				if _, werr := clientConn.Write(buf[:n]); werr != nil {
+					// client side died: abort the relay locally, keep the exit
+					stopRelay()
+					t2cErrCh <- nil
+					return
+				}
+			}
+		}
+	}()
+	// Client -> tunnel: any read failure here is a LOCAL client problem.
+	io.Copy(conn, clientConn)
+	stopRelay()
+	// Give the upstream pump a beat to notice the closed sockets.
+	select {
+	case upErr := <-t2cErrCh:
+		if upErr != nil && upErr != io.EOF && !errors.Is(upErr, net.ErrClosed) {
+			pool.Fail(exit, "tunnel read error: "+upErr.Error())
+		}
+	case <-time.After(3 * time.Second):
 	}
 	clientConn.Close()
 	conn.Close()
