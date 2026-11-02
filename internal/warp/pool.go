@@ -13,6 +13,13 @@ const (
 	registrationTimeout = 30 * time.Second
 	maxRetries          = 3
 	retryDelay          = 5 * time.Second
+
+	// Replacement retry: after createExit fails once (e.g. transient DNS
+	// outage), retry with exponential backoff 10s -> 60s cap, up to 20
+	// attempts (~15 min coverage) so the pool self-heals without a restart.
+	replaceRetryInitial  = 10 * time.Second
+	replaceRetryMaxDelay = 60 * time.Second
+	replaceRetryAttempts = 20
 )
 
 type Pool struct {
@@ -22,6 +29,9 @@ type Pool struct {
 	healthy     int
 	coolingDown int
 	recycling   bool // a recycle is creating fresh exits; never double-run
+	retrying    map[*Exit]bool
+	stopped     chan struct{}
+	closeOnce   sync.Once
 }
 
 func NewPool(cfg PoolConfig) (*Pool, error) {
@@ -33,8 +43,10 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 	}
 
 	p := &Pool{
-		config: cfg,
-		exits:  make([]*Exit, 0, cfg.PoolSize),
+		config:   cfg,
+		exits:    make([]*Exit, 0, cfg.PoolSize),
+		retrying: make(map[*Exit]bool),
+		stopped:  make(chan struct{}),
 	}
 
 	for i := 0; i < cfg.PoolSize; i++ {
@@ -119,15 +131,58 @@ func (p *Pool) ensureExit(ctx context.Context, index int) {
 }
 
 func (p *Pool) replaceExit(failed *Exit) {
-	ctx, cancel := context.WithTimeout(context.Background(), registrationTimeout)
-	defer cancel()
-
-	exit, err := p.createExit(ctx)
-	if err != nil {
-		log.Printf("Failed to replace WARP exit: %v", err)
+	// Dedup guard: Fail + concurrent RecycleAll must not stack two retry
+	// loops for the same exit.
+	p.mu.Lock()
+	if p.retrying[failed] {
+		p.mu.Unlock()
 		return
 	}
+	p.retrying[failed] = true
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.retrying, failed)
+		p.mu.Unlock()
+	}()
 
+	delay := replaceRetryInitial
+	for attempt := 1; attempt <= replaceRetryAttempts; attempt++ {
+		select {
+		case <-p.stopped:
+			log.Printf("WARP pool closed: replacement for %s aborted", failed.ID)
+			return
+		default:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), registrationTimeout)
+		exit, err := p.createExit(ctx)
+		cancel()
+		if err == nil {
+			p.finishReplacement(failed, exit)
+			return
+		}
+
+		if attempt == replaceRetryAttempts {
+			log.Printf("WARP pool replacement permanently failed for %s after %d attempts: %v (exit stays in cooldown; manual recovery via RecycleAll once network recovers)", failed.ID, attempt, err)
+			return
+		}
+		log.Printf("WARP exit replacement failed for %s (attempt %d/%d, next retry in %v): %v", failed.ID, attempt, replaceRetryAttempts, delay, err)
+
+		select {
+		case <-p.stopped:
+			log.Printf("WARP pool closed: replacement for %s aborted", failed.ID)
+			return
+		case <-time.After(delay):
+		}
+		delay *= 2
+		if delay > replaceRetryMaxDelay {
+			delay = replaceRetryMaxDelay
+		}
+	}
+}
+
+func (p *Pool) finishReplacement(failed, exit *Exit) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -269,6 +324,7 @@ func (p *Pool) statusLocked() map[string]any {
 }
 
 func (p *Pool) Close() {
+	p.closeOnce.Do(func() { close(p.stopped) })
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, e := range p.exits {
