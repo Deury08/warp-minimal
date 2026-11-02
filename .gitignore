@@ -4,3 +4,5 @@
 goroutines.txt
 cfg*.json
 config-test*.txt
+warp-test-*.exe
+warptest*.exe
