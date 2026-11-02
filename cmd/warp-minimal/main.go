@@ -75,20 +75,22 @@ func main() {
 		log.Printf("ERROR: cannot open log file %s: %v (stdout only)", logPath, err)
 	}
 
-	// Pool agnóstico del stack: masque usa el pool MASQUE (Stack vacío ->
-	// default ipv6 de pool.go); cualquier otro valor mantiene el pool
-	// WireGuard exactamente como antes.
+	// Pool agnóstico del stack: la familia masque (config "masque" o los
+	// valores de registro del pool MASQUE "ipv6"/"warp", que era como lo
+	// escribía la config del plugin v0.1.x) usa el pool MASQUE; cualquier
+	// otro valor mantiene el pool WireGuard exactamente como antes.
 	stackLabel := "wireguard"
 	var pool appPool
 	var egressPool warp.EgressPool
-	if cfg.Stack == "masque" {
+	switch cfg.Stack {
+	case "masque", "ipv6", "warp":
 		stackLabel = "masque"
 		p, err := warp.NewPool(warp.PoolConfig{PoolSize: cfg.PoolSize})
 		if err != nil {
 			log.Fatalf("create warp pool: %v", err)
 		}
 		pool, egressPool = p, warp.MasquePoolEgress(p)
-	} else {
+	default:
 		reg := warp.NewWGRegistrar()
 		p, err := warp.NewWGPool(warp.PoolConfig{
 			PoolSize: cfg.PoolSize,
