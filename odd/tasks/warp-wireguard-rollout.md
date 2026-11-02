@@ -52,13 +52,15 @@ on large payloads, exits kept healthy, prove E2E.
 | T3.2 | Wire stack=masque into main.go: unified EgressPool interface in proxy.go + stack switch in main.go | delegated writer | done (code) |
 | T3.3 | Self-healing replacement: replaceExit retries createExit with 10s->60s exponential backoff, 20 attempts, dedup guard, pool-close aware | delegated writer | done (code) |
 | T4 | Verify: unit tests green; standalone repro via local MASQUE proxy binary on test port: 64KB+ upload 200 OK, trace warp=on | inline | done — live 8793: 64KB 200@3.4s, 200KB 200@1.1s, 1MB 200@10.6s, warp=on, pool healthy |
-| T5 | E2E through bridge: enable warp, big POST via relay, real round; no 502 | inline | pending — needs deploy to plugin + warpEnabled on (user gate) |
-| T6 | Record results, tag v0.2.1 (incl. Acquire fix + RecycleAll + flow-control fix), update doc + memory | inline | pending |
+| T5 | E2E through bridge: enable warp, big POST via relay, real round; no 502 | inline | done — relay 8788 with RELAY_CONFIG_PATH set (warpMode on, lastEgress warp), POST /v1/chat/completions http=200 @4.9s with SSE body; deployed MASQUE proxy 8789 healthy. Gotcha: relay started manually must get RELAY_CONFIG_PATH or warp stays off |
+| T6 | Record results, tag v0.2.1 (incl. Acquire fix + RecycleAll + flow-control fix + self-healing replaceExit), update doc + memory | inline | pending tag push (user gate; code+docs done, branch pushed) |
 
 ## Verification evidence
 
 - Commits: 00ccefe (recycle + hygiene), b022543 (flow fix + masque rewiring).
 - Review assess (average risk, base ac9fa63, committed-only): medium / review_due=false (under_budget).
+- Review assess (fix pool retry, base ac9fa63, committed-only): medium / review_due=false (under_budget, 486 lines; incl. e1caaf9).
+- E2E live (2026-11-02): relay 8788 -> warp 8789 egress, POST 200 @4.9s, SSE body returned, relay /health lastEgress=warp. Recovered from live empty-pool incident (both exits dead + failed re-registration during a DNS outage) — restart manual; root-cause fixed by e1caaf9 (backoff retry).
 - Authors: parent builds only; two delegated writers implemented T3 and T3.2 with parent spot checks; live tests observed directly on port 8793.
 
 ## Verification checklist
