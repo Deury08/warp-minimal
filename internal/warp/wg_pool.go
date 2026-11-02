@@ -93,13 +93,23 @@ func (p *wgPool) addExit(ctx context.Context) {
 // sizeLocked devuelve la cantidad de exits (llamada con mu retenido).
 func (p *wgPool) sizeLocked() int { return len(p.exits) }
 
+// acquireTimeout es el tiempo máximo que Acquire espera por un exit sano
+// antes de rendirse, para que el proxy no se quede colgado y el relay pueda
+// hacer fallback a local.
+const acquireTimeout = 10 * time.Second
+
 // Acquire devuelve un exit sano disponible, rotando round-robin. Espera hasta
-// que haya uno sano o se cancele el contexto.
+// que haya uno sano, se cancele el contexto, o se agote acquireTimeout.
 func (p *wgPool) Acquire(ctx context.Context) (*exitWG, error) {
+	// Acquire con plazo propio: si el registro de exits está fallando (no hay
+	// exits o todos están en cooldown/cerrados), no bloquear para siempre.
+	acquireCtx, cancel := context.WithTimeout(ctx, acquireTimeout)
+	defer cancel()
+
 	for {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-acquireCtx.Done():
+			return nil, fmt.Errorf("no WARP exit available after %v: %w", acquireTimeout, acquireCtx.Err())
 		default:
 		}
 
