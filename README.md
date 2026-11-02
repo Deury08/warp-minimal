@@ -1,6 +1,6 @@
 # warp-minimal
 
-> **Minimal WARP egress proxy** — Rotating exits via **Cloudflare WARP WireGuard** (userspace, UDP 2408), zero GPL dependencies, pool with preload and auto-rotation so tunnels don't drop under real traffic.
+> **Minimal WARP egress proxy** — Rotating exits via **Cloudflare WARP MASQUE** (QUIC Connect-IP over UDP 443), zero GPL dependencies, pool with preload and auto-rotation so tunnels don't drop under real traffic.
 
 [![Release](https://img.shields.io/github/v/release/Deury08/warp-minimal?label=latest)](https://github.com/Deury08/warp-minimal/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -15,18 +15,21 @@
 
 It has **zero dependencies on any specific project** — use it with any HTTP client.
 
-### Why WireGuard (UDP 2408)?
+### Why MASQUE (UDP 443)?
 
-WireGuard in userspace (no root, no TUN, no `NET_ADMIN`) gives a lean, stable
-egress with a persistent 25s keepalive that keeps the Cloudflare NAT mapping
-alive, so tunnels don't drop under real traffic. The pool preloads half its
-size (minimum 1 hot exit), rotates immediately on HTTP 429/403 or socket
-errors, and keeps each egress block (/64 IPv6 or /32 IPv4) in a 30-minute
-cooldown after a failure.
+MASQUE (QUIC Connect-IP) is the default egress: it is the same transport the
+official 1.1.1.1 client uses, it survives networks where WireGuard handshakes
+are killed by DPI (many residential ISPs selectively drop UDP 2408), and it
+runs fully in userspace (quic-go + gVisor netstack — no root, no TUN). QUIC
+path-MTU discovery (with initial packet size 1242 as floor) plus ICMP
+Packet-Too-Big feedback into the netstack keep large uploads (64KB+) flowing.
+The pool preloads half its size (minimum 1 hot exit), rotates immediately on
+HTTP 429/403 or socket errors, and self-heals: a dead tunnel fails its exit and
+a replacement registers automatically, retrying with backoff (10s → 60s, 20
+attempts) so a transient registration failure cannot leave the pool empty.
 
-Where an ISP blocks UDP 2408 (DPI on WireGuard handshakes), the old MASQUE
-(QUIC Connect-IP, UDP 443) path remains available by setting
-`"stack": "masque"` in `config.json`.
+The userspace WireGuard stack (UDP 2408, 25s keepalive) remains available as
+`"stack": "wireguard"` for networks where WG handshakes are not dropped.
 
 ---
 
@@ -34,13 +37,14 @@ Where an ISP blocks UDP 2408 (DPI on WireGuard handshakes), the old MASQUE
 
 | Feature | Detail |
 |---------|--------|
-| **WireGuard egress (UDP 2408)** | Register → X25519 device (POST /reg, PATCH enable WARP) → userspace WG tunnel (wireguard-go + gVisor) |
+| **MASQUE egress (QUIC / UDP 443)** | Register → ECDSA P-256 device enrollment → QUIC Connect-IP tunnel (quic-go + gVisor). WireGuard (UDP 2408) remains as `stack: "wireguard"` fallback |
 | **Pool with preload** | Half the pool (min 1) hot before first traffic; round-robin acquisition |
 | **Auto-rotation** | Immediate drop + background re-register on HTTP 429/403 or socket error |
 | **Cooldown per egress block** | 30 min per /64 IPv6 or /32 IPv4 after a failure |
-| **Persistent keepalive** | 25s so the Cloudflare NAT mapping stays alive under traffic |
-| **Self-healing** | A dead tunnel fails its exit and is auto-replaced |
-| **Userspace** | No root, no TUN, no `NET_ADMIN` — wireguard-go + gVisor netstack |
+| **Idle keepalive** | 30s QUIC PING so the NAT mapping stays alive under traffic |
+| **Large-upload flow control** | QUIC path-MTU discovery (1242B floor) + ICMP Packet-Too-Big feedback into the netstack — ≥64KB uploads no longer stall |
+| **Self-healing pool** | Dead tunnels fail their exit and are auto-replaced; failed registrations retry with exponential backoff (10s → 60s, 20 attempts) instead of leaving the pool empty |
+| **Userspace** | No root, no TUN, no `NET_ADMIN` — quic-go + gVisor netstack |
 | **TLS fingerprint** | uTLS with Bun ClientHello (JA4 `t13d1713h1`) to pass fingerprint gates |
 | **Health endpoint** | `GET /health` → JSON pool status |
 | **License** | **MIT** (wireguard-go is MIT-like and compatible; only the WireGuard kernel module is GPLv2 and is NOT used) |
@@ -60,7 +64,7 @@ Where an ISP blocks UDP 2408 (DPI on WireGuard handshakes), the old MASQUE
    enrolled key (self-signed cert, 24 h), `ConnectionIDLength: 20`
    (mandatory — otherwise the backend aborts with `PROTOCOL_VIOLATION`),
    H3 datagrams + deprecated `SETTINGS_H3_DATAGRAM_00 (0x276)`,
-   `InitialPacketSize 1242`, keepalive 10 s.
+   `InitialPacketSize 1242` as the PMTUD floor, keepalive 30 s.
 4. **CONNECT-IP** — Cloudflare's non-RFC variant: request protocol
    `cf-connect-ip`, authority `cloudflareaccess.com` (URI template), and —
    critically — an **explicitly empty `User-Agent` header** on the extended
@@ -75,7 +79,9 @@ Where an ISP blocks UDP 2408 (DPI on WireGuard handshakes), the old MASQUE
    `inject_test.go` regression test).
 7. **Pool rotation** — exit failures (dead QUIC session, dial errors) trip a
    one-shot `Tunnel.SetOnDead` hook → `Pool.Fail` → auto replacement with a
-   fresh registration (intentional `Close()` never triggers it).
+   fresh registration (intentional `Close()` never triggers it). A failing
+   registration retries with backoff instead of abandoning the pool; `POST
+   /recycle` forces an idempotent pool-wide recycle.
 
 ---
 
@@ -119,7 +125,7 @@ curl -x http://127.0.0.1:8789 https://www.google.com -o /dev/null -w "%{http_cod
 |-------|---------|-------------|
 | `listen` | `127.0.0.1:8789` | HTTP proxy listen address |
 | `pool_size` | `2` | Concurrent WARP exits |
-| `stack` | `ipv6` | Egress preference (Cloudflare assigns both a v4 and a v6 to every MASQUE device) |
+| `stack` | `ipv6` | Egress stack: `masque` / `ipv6` / `warp` all select the MASQUE (QUIC) pool; `wireguard` selects the userspace WG tunnel |
 | `health_path` | `/health` | Health endpoint path |
 
 ---
@@ -228,7 +234,7 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 | Client key | ECDSA P-256, DER/base64, cert self-signed (24 h client auth) |
 | UP | `162.159.198.2:443` (from `peers[0].endpoint`) |
 | SNI | `consumer-masque.cloudflareclient.com`, ALPN `h3` |
-| QUIC | CID length 20, datagrams + `0x276`, IPP 1242, keepalive 10 s |
+| QUIC | CID length 20, datagrams + `0x276`, InitialPacketSize 1242 + PMTUD, keepalive 30 s |
 | CONNECT | `:protocol: cf-connect-ip`, `:authority: cloudflareaccess.com`, UA `` (empty), CF-Client-Version `a-6.35-4471` |
 | Framing | Raw IP packets as QUIC datagrams with 1-byte context ID `0` |
 
@@ -254,7 +260,7 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 **NOTICE**: attribution for:
 - Cloudflare WARP MASQUE protocol (reverse-engineered from 1.1.1.1 client; clean-room)
 - `github.com/Diniboy1123/connect-ip-go` (protocol notes + datagram framing; check NOTICE)
-- `github.com/quic-go/quic-go` (MIT, pinned v0.59.0 for the fork's API)
+- `github.com/quic-go/quic-go` (MIT, pinned v0.60.0 for the fork's API)
 - `golang.zx2c4.com/wireguard` (MIT)
 - `gvisor.dev/gvisor` (Apache-2.0)
 - `github.com/refraction-networking/utls` (MIT)
@@ -271,6 +277,13 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 ---
 
 ## Changelog
+
+### v0.2.1 (2026-11-02)
+- **Large MASQUE uploads fixed (≥64KB no longer stall ~15s)**: QUIC path-MTU discovery enabled (1242B floor instead of fixed Mickey-Mouse packets), ICMP Packet-Too-Big relayed into the gVisor netstack, keepalive 10s → 30s; quic-go pinned v0.60.0
+- **Self-healing pools made robust**: failed exit replacements retry registration with exponential backoff (10s → 60s, 20 attempts) — a transient failure (e.g. DNS blip during re-registration) can no longer leave the pool empty until restart
+- Stack switch hardened: `masque` / `ipv6` / `warp` all select the MASQUE pool (previously `stack: "ipv6"` silently fell back to WireGuard)
+- Idempotent `POST /recycle` MASQUE pool recycle (matches the WG pool behavior)
+- Verified end-to-end through pi-free-bridge: relay `lastEgress: warp`, `cdn-cgi/trace` exits from the WARP reserved range (`2a09:bac1:...`), 200KB/1MB uploads OK
 
 ### v0.1.1 (2026-10-31)
 - **Egress switched to MASQUE (QUIC Connect-IP) by default** — WireGuard falls back only if explicitly configured

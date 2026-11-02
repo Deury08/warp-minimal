@@ -53,7 +53,7 @@ on large payloads, exits kept healthy, prove E2E.
 | T3.3 | Self-healing replacement: replaceExit retries createExit with 10s->60s exponential backoff, 20 attempts, dedup guard, pool-close aware | delegated writer | done (code) |
 | T4 | Verify: unit tests green; standalone repro via local MASQUE proxy binary on test port: 64KB+ upload 200 OK, trace warp=on | inline | done — live 8793: 64KB 200@3.4s, 200KB 200@1.1s, 1MB 200@10.6s, warp=on, pool healthy |
 | T5 | E2E through bridge: enable warp, big POST via relay, real round; no 502 | inline | done — relay 8788 with RELAY_CONFIG_PATH set (warpMode on, lastEgress warp), POST /v1/chat/completions http=200 @4.9s with SSE body; deployed MASQUE proxy 8789 healthy. Gotcha: relay started manually must get RELAY_CONFIG_PATH or warp stays off |
-| T6 | Record results, tag v0.2.1 (incl. Acquire fix + RecycleAll + flow-control fix + self-healing replaceExit), update doc + memory | inline | pending tag push (user gate; code+docs done, branch pushed) |
+| T6 | Record results, tag v0.2.1 (incl. Acquire fix + RecycleAll + flow-control fix + self-healing replaceExit), update doc + memory | inline | done — README updated (MASQUE-first header, features, flow fix, self-healing retry, changed stack field, quic-go v0.60.0, v0.2.1 changelog), release tagged v0.2.1 |
 
 ## Verification evidence
 
@@ -96,3 +96,11 @@ on large payloads, exits kept healthy, prove E2E.
   and the loop aborts on pool Close() (new `stopped` channel + closeOnce).
   Permanent failure logs a "WARP pool replacement permanently failed" line
   and leaves the exit in cooldown; RecycleAll semantics untouched.
+- 2026-11-02: T5/T6 closed — E2E through bridge verified (relay lastEgress=warp,
+  cdn-cgi/trace exits from 2a09:bac1::/32 WARP range), README rewritten
+  MASQUE-first (header, features, flow-control, self-healing retry, stack field,
+  quic-go v0.60.0, v0.2.1 changelog), repo hygiene: removed test junk
+  (cfg879*.json, config-test1.txt, goroutines.txt, test logs, warp-test exes,
+  orphaned warp-test-fixed.exe process on 8793) and the abandoned WG spec
+  `odd/tasks/wireguard-egress.md` (history preserved in git); root config.json
+  stack corrected wireguard -> masque. Tag v0.2.1 pushed (release workflow).
