@@ -21,6 +21,7 @@ type Pool struct {
 	exits       []*Exit
 	healthy     int
 	coolingDown int
+	recycling   bool // a recycle is creating fresh exits; never double-run
 }
 
 func NewPool(cfg PoolConfig) (*Pool, error) {
@@ -130,15 +131,29 @@ func (p *Pool) replaceExit(failed *Exit) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// Close the old tunnel
+	if failed.Tunnel() != nil {
+		failed.Tunnel().Close()
+	}
 	for i, e := range p.exits {
 		if e == failed {
 			p.exits[i] = exit
 			break
 		}
 	}
-	p.healthy++
-	p.coolingDown--
-	log.Printf("WARP exit replaced: %s -> %s", failed.ID, exit.ID)
+	// Recalculate counters from actual state
+	healthy := 0
+	cooling := 0
+	for _, e := range p.exits {
+		if e.Cooldown.IsZero() && e.Tunnel() != nil {
+			healthy++
+		} else if !e.Cooldown.IsZero() {
+			cooling++
+		}
+	}
+	p.healthy = healthy
+	p.coolingDown = cooling
+	log.Printf("WARP exit replaced: %s -> %s (healthy=%d cooling=%d)", failed.ID, exit.ID, healthy, cooling)
 }
 
 func (p *Pool) createExit(ctx context.Context) (*Exit, error) {
@@ -174,10 +189,61 @@ func (p *Pool) createExit(ctx context.Context) (*Exit, error) {
 	return exit, nil
 }
 
+// Recycle re-enrolls every exit so all tunnels get fresh WARP egress IPs.
+// Idempotent: a second call while a recycle is in flight just reports the
+// in-flight state and never duplicates the (rate-limited) enrollment work.
+// Returns recycling=true if a new cycle started, plus the current Status
+// snapshot either way; Status carries "recycling" for the caller.
+func (p *Pool) RecycleAll() (started bool, status map[string]any) {
+	p.mu.Lock()
+	if p.recycling {
+		s := p.statusLocked()
+		p.mu.Unlock()
+		return false, s
+	}
+	p.recycling = true
+	targets := make([]*Exit, 0, len(p.exits))
+	for _, e := range p.exits {
+		if e != nil && !e.Cooldown.IsZero() {
+			// Already cooling down: its replacement is running.
+			continue
+		}
+		targets = append(targets, e)
+	}
+	snapshot := p.statusLocked()
+	p.mu.Unlock()
+	if len(targets) == 0 {
+		p.mu.Lock()
+		p.recycling = false
+		p.mu.Unlock()
+		return false, snapshot
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(targets))
+	for _, t := range targets {
+		go func(ex *Exit) {
+			defer wg.Done()
+			p.replaceExit(ex)
+		}(t)
+	}
+	go func() {
+		wg.Wait()
+		p.mu.Lock()
+		p.recycling = false
+		p.mu.Unlock()
+		log.Print("WARP pool recycle complete: fresh egress addresses enrolled")
+	}()
+	return true, snapshot
+}
+
 func (p *Pool) Status() map[string]any {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.statusLocked()
+}
 
+func (p *Pool) statusLocked() map[string]any {
+	// MUST be called with p.mu already held. Do not lock here.
 	exits := make([]string, len(p.exits))
 	for i, e := range p.exits {
 		status := "healthy"
@@ -194,6 +260,7 @@ func (p *Pool) Status() map[string]any {
 
 	return map[string]any{
 		"pool_size":    p.config.PoolSize,
+		"recycling":    p.recycling,
 		"active":       len(p.exits),
 		"healthy":      p.healthy,
 		"cooling_down": p.coolingDown,

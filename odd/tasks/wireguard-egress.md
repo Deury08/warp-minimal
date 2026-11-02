@@ -33,5 +33,7 @@ Replace Cloudflare WARP MASQUE (QUIC Connect-IP, UDP 443) with WireGuard userspa
 - pi-free-bridge odd/tasks: bridge-go.md, bun-relay.md, bun-upgrades.md, pi-free-bridge.md, relay-warp-hot-reload.md, warp-auto-recycle.md (reference for pool/recycle patterns).
 - The go.mod already requires golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f; /device and /tun are importable subpackages of that same module (wireguard-go), no go.mod change needed.
 - Done: T1..T8 all implemented. warp-minimal: build/vet/tests OK; pi-free-bridge: syntax OK + 53 tests pass.
-- Pending: live functional check `curl -x http://127.0.0.1:8789 https://1.1.1.1/cdn-cgi/trace` → `warp=on` (requires real network to api.cloudflareclient.com + UDP 2408; not run here).
-- Risk: item 3 (changing a consumed contract: stack flag + proxy path) + item 1 (userspace tunnel, no data persistence, reversible).
+- Live functional check: `curl -x http://127.0.0.1:8789 https://1.1.1.1/cdn-cgi/trace` → `warp=on` ✅ (real network, Cloudflare MIA, IP 104.28.201.92).
+- Commits: warp-minimal feat/wireguard-egress (2 work-unit commits, 1008 lines) merged to main via PR #2; pi-free-bridge feat/wireguard-fallback (1 commit, 48 lines) merged to master via PR #5.
+- Releases: warp-minimal v0.2.0, pi-free-bridge v0.3.0.
+- Risk: item 3 (changing a consumed contract: stack flag + proxy path) + item 1 (userspace tunnel, no data persistence, reversible). Both mitigated: MASQUE path kept as fallback via `stack: "masque"`, no data persisted, fully reversible by reverting config stack.

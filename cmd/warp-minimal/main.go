@@ -33,7 +33,7 @@ func main() {
 	flag.Parse()
 
 	if *version {
-		fmt.Println("warp-minimal v0.1.0")
+		fmt.Println("warp-minimal v0.2.1")
 		return
 	}
 
