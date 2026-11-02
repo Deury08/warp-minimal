@@ -17,15 +17,108 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+// EgressDialer es la vista mínima de un exit: dial TCP sobre el túnel WARP
+// ya establecido. Tanto *exitWG (WireGuard) como *Exit (MASQUE) lo satisfacen.
+type EgressDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// EgressPool abstrae el pool de exits para que el proxy ignore el stack
+// (WireGuard vs MASQUE) que lo sirve.
+type EgressPool interface {
+	Acquire(ctx context.Context) (EgressDialer, error)
+	Release(exit EgressDialer)
+}
+
+// failable es la capacidad opcional de marcar un exit como fallido (ambos
+// pools la exponen; la extracción del interfaz la mantiene mínima).
+type failable interface {
+	Fail(exit EgressDialer, reason string)
+}
+
+// failExit marca el exit como fallido si el pool lo soporta.
+func failExit(pool failable, exit EgressDialer, reason string) {
+	if pool != nil {
+		pool.Fail(exit, reason)
+	}
+}
+
+// egressExitID devuelve el identificador del exit para diagnósticos.
+// *exitWG expone ID() como método y *Exit como campo; en vez de cambiar
+// esas firmas, se resuelve best-effort aquí.
+func egressExitID(exit EgressDialer) string {
+	type ider interface{ ID() string }
+	if id, ok := exit.(ider); ok {
+		return id.ID()
+	}
+	if e, ok := exit.(*Exit); ok {
+		return e.ID
+	}
+	return "unknown"
+}
+
+// wgPoolEgress adapta *wgPool al interfaz EgressPool sin cambiar las firmas
+// públicas del pool de WireGuard.
+type wgPoolEgress struct{ pool *wgPool }
+
+func (a wgPoolEgress) Acquire(ctx context.Context) (EgressDialer, error) {
+	return a.pool.Acquire(ctx)
+}
+
+func (a wgPoolEgress) Release(exit EgressDialer) {
+	if e, ok := exit.(*exitWG); ok {
+		a.pool.Release(e)
+	}
+}
+
+func (a wgPoolEgress) Fail(exit EgressDialer, reason string) {
+	if e, ok := exit.(*exitWG); ok {
+		a.pool.Fail(e, reason)
+	}
+}
+
+// masquePoolEgress adapta *Pool (stack MASQUE) al interfaz EgressPool.
+type masquePoolEgress struct{ pool *Pool }
+
+func (a masquePoolEgress) Acquire(ctx context.Context) (EgressDialer, error) {
+	return a.pool.Acquire(ctx)
+}
+
+func (a masquePoolEgress) Release(exit EgressDialer) {
+	if e, ok := exit.(*Exit); ok {
+		a.pool.Release(e)
+	}
+}
+
+func (a masquePoolEgress) Fail(exit EgressDialer, reason string) {
+	if e, ok := exit.(*Exit); ok {
+		a.pool.Fail(e, reason)
+	}
+}
+
+// WGPoolEgress devuelve el pool WireGuard visto como EgressPool.
+func WGPoolEgress(pool *wgPool) EgressPool { return wgPoolEgress{pool: pool} }
+
+// MasquePoolEgress devuelve el pool MASQUE visto como EgressPool.
+func MasquePoolEgress(pool *Pool) EgressPool { return masquePoolEgress{pool: pool} }
+
 // ProxyHandler crea un HTTP handler que reenvía requests a través de exits
 // WireGuard del pool. Maneja tanto CONNECT (tunelado HTTPS) como requests HTTP
-// normales de proxy.
+// normales de proxy. Compat: construye sobre el proxy agnóstico del stack.
 func ProxyHandler(pool *wgPool) http.HandlerFunc {
+	return ProxyHandlerEgress(WGPoolEgress(pool))
+}
+
+// ProxyHandlerEgress crea el handler de proxy sobre cualquier pool de exits
+// (WireGuard o MASQUE). Maneja tanto CONNECT (tunelado HTTPS) como requests
+// HTTP normales de proxy.
+func ProxyHandlerEgress(pool EgressPool) http.HandlerFunc {
+	failer, _ := pool.(failable)
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
 		if r.Method == http.MethodConnect {
-			handleConnect(w, r, pool)
+			handleConnect(w, r, pool, failer)
 			return
 		}
 
@@ -38,14 +131,14 @@ func ProxyHandler(pool *wgPool) http.HandlerFunc {
 
 		if err := proxyRequest(ctx, w, r, exit); err != nil {
 			log.Printf("WARP proxy error: %v", err)
-			pool.Fail(exit, err.Error())
+			failExit(failer, exit, err.Error())
 			http.Error(w, fmt.Sprintf("WARP proxy error: %v", err), http.StatusBadGateway)
 		}
 	}
 }
 
-// handleConnect establece un túnel TCP a través de un exit WireGuard para tráfico HTTPS.
-func handleConnect(w http.ResponseWriter, r *http.Request, pool *wgPool) {
+// handleConnect establece un túnel TCP a través de un exit WARP para tráfico HTTPS.
+func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, failer failable) {
 	ctx := r.Context()
 
 	exit, err := pool.Acquire(ctx)
@@ -66,9 +159,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *wgPool) {
 
 	conn, err := exit.DialContext(ctx, "tcp", target)
 	if err != nil {
-		log.Printf("CONNECT %s: dial failed on exit %s: %v", target, exit.ID(), err)
+		log.Printf("CONNECT %s: dial failed on exit %s: %v", target, egressExitID(exit), err)
 		http.Error(w, fmt.Sprintf("WARP dial failed: %v", err), http.StatusBadGateway)
-		pool.Fail(exit, err.Error())
+		failExit(failer, exit, err.Error())
 		return
 	}
 
@@ -78,7 +171,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *wgPool) {
 		log.Printf("CONNECT %s: hijacking not supported", target)
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		conn.Close()
-		pool.Fail(exit, "hijacking not supported")
+		failExit(failer, exit, "hijacking not supported")
 		return
 	}
 
@@ -87,7 +180,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *wgPool) {
 		log.Printf("CONNECT %s: hijack failed: %v", target, err)
 		http.Error(w, fmt.Sprintf("hijacking failed: %v", err), http.StatusInternalServerError)
 		conn.Close()
-		pool.Fail(exit, err.Error())
+		failExit(failer, exit, err.Error())
 		return
 	}
 
@@ -100,7 +193,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *wgPool) {
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		clientConn.Close()
 		conn.Close()
-		pool.Fail(exit, err.Error())
+		failExit(failer, exit, err.Error())
 		return
 	}
 
@@ -145,7 +238,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *wgPool) {
 	select {
 	case upErr := <-t2cErrCh:
 		if upErr != nil && upErr != io.EOF && !errors.Is(upErr, net.ErrClosed) {
-			pool.Fail(exit, "tunnel read error: "+upErr.Error())
+			failExit(failer, exit, "tunnel read error: "+upErr.Error())
 		}
 	case <-time.After(3 * time.Second):
 	}
@@ -153,8 +246,8 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool *wgPool) {
 	conn.Close()
 }
 
-// proxyRequest reenvía un único request HTTP a través de un exit WireGuard.
-func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, exit *exitWG) error {
+// proxyRequest reenvía un único request HTTP a través de un exit WARP.
+func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, exit EgressDialer) error {
 	host := r.URL.Host
 	if !strings.Contains(host, ":") {
 		if r.URL.Scheme == "https" {

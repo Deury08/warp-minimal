@@ -13,6 +13,13 @@ const (
 	registrationTimeout = 30 * time.Second
 	maxRetries          = 3
 	retryDelay          = 5 * time.Second
+
+	// Replacement retry: after createExit fails once (e.g. transient DNS
+	// outage), retry with exponential backoff 10s -> 60s cap, up to 20
+	// attempts (~15 min coverage) so the pool self-heals without a restart.
+	replaceRetryInitial  = 10 * time.Second
+	replaceRetryMaxDelay = 60 * time.Second
+	replaceRetryAttempts = 20
 )
 
 type Pool struct {
@@ -21,6 +28,10 @@ type Pool struct {
 	exits       []*Exit
 	healthy     int
 	coolingDown int
+	recycling   bool // a recycle is creating fresh exits; never double-run
+	retrying    map[*Exit]bool
+	stopped     chan struct{}
+	closeOnce   sync.Once
 }
 
 func NewPool(cfg PoolConfig) (*Pool, error) {
@@ -32,8 +43,10 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 	}
 
 	p := &Pool{
-		config: cfg,
-		exits:  make([]*Exit, 0, cfg.PoolSize),
+		config:   cfg,
+		exits:    make([]*Exit, 0, cfg.PoolSize),
+		retrying: make(map[*Exit]bool),
+		stopped:  make(chan struct{}),
 	}
 
 	for i := 0; i < cfg.PoolSize; i++ {
@@ -118,27 +131,84 @@ func (p *Pool) ensureExit(ctx context.Context, index int) {
 }
 
 func (p *Pool) replaceExit(failed *Exit) {
-	ctx, cancel := context.WithTimeout(context.Background(), registrationTimeout)
-	defer cancel()
-
-	exit, err := p.createExit(ctx)
-	if err != nil {
-		log.Printf("Failed to replace WARP exit: %v", err)
+	// Dedup guard: Fail + concurrent RecycleAll must not stack two retry
+	// loops for the same exit.
+	p.mu.Lock()
+	if p.retrying[failed] {
+		p.mu.Unlock()
 		return
 	}
+	p.retrying[failed] = true
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.retrying, failed)
+		p.mu.Unlock()
+	}()
 
+	delay := replaceRetryInitial
+	for attempt := 1; attempt <= replaceRetryAttempts; attempt++ {
+		select {
+		case <-p.stopped:
+			log.Printf("WARP pool closed: replacement for %s aborted", failed.ID)
+			return
+		default:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), registrationTimeout)
+		exit, err := p.createExit(ctx)
+		cancel()
+		if err == nil {
+			p.finishReplacement(failed, exit)
+			return
+		}
+
+		if attempt == replaceRetryAttempts {
+			log.Printf("WARP pool replacement permanently failed for %s after %d attempts: %v (exit stays in cooldown; manual recovery via RecycleAll once network recovers)", failed.ID, attempt, err)
+			return
+		}
+		log.Printf("WARP exit replacement failed for %s (attempt %d/%d, next retry in %v): %v", failed.ID, attempt, replaceRetryAttempts, delay, err)
+
+		select {
+		case <-p.stopped:
+			log.Printf("WARP pool closed: replacement for %s aborted", failed.ID)
+			return
+		case <-time.After(delay):
+		}
+		delay *= 2
+		if delay > replaceRetryMaxDelay {
+			delay = replaceRetryMaxDelay
+		}
+	}
+}
+
+func (p *Pool) finishReplacement(failed, exit *Exit) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// Close the old tunnel
+	if failed.Tunnel() != nil {
+		failed.Tunnel().Close()
+	}
 	for i, e := range p.exits {
 		if e == failed {
 			p.exits[i] = exit
 			break
 		}
 	}
-	p.healthy++
-	p.coolingDown--
-	log.Printf("WARP exit replaced: %s -> %s", failed.ID, exit.ID)
+	// Recalculate counters from actual state
+	healthy := 0
+	cooling := 0
+	for _, e := range p.exits {
+		if e.Cooldown.IsZero() && e.Tunnel() != nil {
+			healthy++
+		} else if !e.Cooldown.IsZero() {
+			cooling++
+		}
+	}
+	p.healthy = healthy
+	p.coolingDown = cooling
+	log.Printf("WARP exit replaced: %s -> %s (healthy=%d cooling=%d)", failed.ID, exit.ID, healthy, cooling)
 }
 
 func (p *Pool) createExit(ctx context.Context) (*Exit, error) {
@@ -174,10 +244,61 @@ func (p *Pool) createExit(ctx context.Context) (*Exit, error) {
 	return exit, nil
 }
 
+// Recycle re-enrolls every exit so all tunnels get fresh WARP egress IPs.
+// Idempotent: a second call while a recycle is in flight just reports the
+// in-flight state and never duplicates the (rate-limited) enrollment work.
+// Returns recycling=true if a new cycle started, plus the current Status
+// snapshot either way; Status carries "recycling" for the caller.
+func (p *Pool) RecycleAll() (started bool, status map[string]any) {
+	p.mu.Lock()
+	if p.recycling {
+		s := p.statusLocked()
+		p.mu.Unlock()
+		return false, s
+	}
+	p.recycling = true
+	targets := make([]*Exit, 0, len(p.exits))
+	for _, e := range p.exits {
+		if e != nil && !e.Cooldown.IsZero() {
+			// Already cooling down: its replacement is running.
+			continue
+		}
+		targets = append(targets, e)
+	}
+	snapshot := p.statusLocked()
+	p.mu.Unlock()
+	if len(targets) == 0 {
+		p.mu.Lock()
+		p.recycling = false
+		p.mu.Unlock()
+		return false, snapshot
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(targets))
+	for _, t := range targets {
+		go func(ex *Exit) {
+			defer wg.Done()
+			p.replaceExit(ex)
+		}(t)
+	}
+	go func() {
+		wg.Wait()
+		p.mu.Lock()
+		p.recycling = false
+		p.mu.Unlock()
+		log.Print("WARP pool recycle complete: fresh egress addresses enrolled")
+	}()
+	return true, snapshot
+}
+
 func (p *Pool) Status() map[string]any {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.statusLocked()
+}
 
+func (p *Pool) statusLocked() map[string]any {
+	// MUST be called with p.mu already held. Do not lock here.
 	exits := make([]string, len(p.exits))
 	for i, e := range p.exits {
 		status := "healthy"
@@ -194,6 +315,7 @@ func (p *Pool) Status() map[string]any {
 
 	return map[string]any{
 		"pool_size":    p.config.PoolSize,
+		"recycling":    p.recycling,
 		"active":       len(p.exits),
 		"healthy":      p.healthy,
 		"cooling_down": p.coolingDown,
@@ -202,6 +324,7 @@ func (p *Pool) Status() map[string]any {
 }
 
 func (p *Pool) Close() {
+	p.closeOnce.Do(func() { close(p.stopped) })
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, e := range p.exits {

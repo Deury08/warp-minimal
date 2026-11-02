@@ -265,6 +265,12 @@ func (t *Tunnel) DialContext(ctx context.Context, network, addr string) (net.Con
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", addr, err)
 	}
+	log.Printf("DIAL %s -> %s proto=%s defaultIPv6=%v", addr, ap.Addr(), protoName(ap.Addr()), t.defaultIPv6)
+	// Forzar IPv6-only cuando el stack está en modo ipv6: rechazar direcciones
+	// IPv4 literales y no hacer fallback a IPv4 si el destino no tiene AAAA.
+	if t.defaultIPv6 && ap.Addr().Is4() {
+		return nil, fmt.Errorf("resolve %s: IPv4 address rejected in ipv6-only stack", addr)
+	}
 	fa := tcpip.FullAddress{
 		Addr: tcpipAddrFromNetIP(ap.Addr()),
 		Port: uint16(ap.Port()),
@@ -304,7 +310,31 @@ func (t *Tunnel) resolveTarget(ctx context.Context, addr string) (netip.AddrPort
 	ctxDial, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
-	ips, err := net.DefaultResolver.LookupNetIP(ctxDial, "ip", host)
+	// En modo IPv6-only, consultar específicamente registros AAAA. En
+	// Windows, el resolver del sistema (GetAddrInfoW con AI_ADDRCONFIG)
+	// filtra resultados IPv6 si la interfaz física no tiene IPv6, aunque
+	// el servidor DNS sí los tenga. Usamos un resolver Go puro (PreferGo)
+	// que hace consultas UDP DNS directamente para evitar esa limitación.
+	var ips []netip.Addr
+	var err error
+	resolver := net.DefaultResolver
+	if t.defaultIPv6 {
+		resolver = &net.Resolver{PreferGo: true}
+		ips, err = resolver.LookupNetIP(ctxDial, "ip6", host)
+		if err != nil || len(ips) == 0 {
+			ips4, err2 := resolver.LookupNetIP(ctxDial, "ip", host)
+			if err2 == nil {
+				for _, ip := range ips4 {
+					a := ip.Unmap()
+					if a.Is6() && !a.Is4In6() {
+						ips = append(ips, a)
+					}
+				}
+			}
+		}
+	} else {
+		ips, err = resolver.LookupNetIP(ctxDial, "ip", host)
+	}
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("dns: %w", err)
 	}
@@ -325,8 +355,12 @@ func (t *Tunnel) resolveTarget(ctx context.Context, addr string) (netip.AddrPort
 		}
 	}
 	if !chosen.IsValid() {
+		if t.defaultIPv6 {
+			return netip.AddrPort{}, fmt.Errorf("no IPv6 address for %q (ipv6-only stack)", addr)
+		}
 		chosen = ips[0].Unmap()
 	}
+	log.Printf("RESOLVE %s -> %s (%s)", addr, chosen, protoName(chosen))
 	portNum, err := net.LookupPort("tcp", port)
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("port %q: %w", port, err)
@@ -347,6 +381,13 @@ func tcpipProtoFor(a netip.Addr, network string) tcpip.NetworkProtocolNumber {
 		return ipv4.ProtocolNumber
 	}
 	return ipv6.ProtocolNumber
+}
+
+func protoName(a netip.Addr) string {
+	if a.Is4() || a.Is4In6() {
+		return "ipv4"
+	}
+	return "ipv6"
 }
 
 // ---- wireguard tun.Device adapter ----

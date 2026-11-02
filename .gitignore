@@ -1,0 +1,8 @@
+# Test/prod runtime artifacts (never commit logs or binaries' leftovers)
+*.log
+*.exe~
+goroutines.txt
+cfg*.json
+config-test*.txt
+warp-test-*.exe
+warptest*.exe

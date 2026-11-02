@@ -110,10 +110,9 @@ func NewMasqueTunnel(ctx context.Context, cfg WireGuardConfig, endpoint string) 
 		InsecureSkipVerify: true,
 	}
 	quicConf := &quic.Config{
-		EnableDatagrams:         true,
-		KeepAlivePeriod:         10 * time.Second,
-		InitialPacketSize:       masquePacketSize,
-		DisablePathMTUDiscovery: true,
+		EnableDatagrams:   true,
+		KeepAlivePeriod:   30 * time.Second,
+		InitialPacketSize: masquePacketSize, // floor below quic-go PMTU discovery
 	}
 
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
@@ -176,7 +175,7 @@ func NewMasqueTunnel(ctx context.Context, cfg WireGuardConfig, endpoint string) 
 				pkt.DecRef()
 				continue
 			}
-			sent, err := ipconn.WritePacket(append([]byte(nil), full...))
+			icmp, err := ipconn.WritePacket(append([]byte(nil), full...))
 			if err != nil {
 				pkt.DecRef()
 				log.Printf("masque: outbound write packet (%d bytes): %v", len(full), err)
@@ -186,8 +185,27 @@ func NewMasqueTunnel(ctx context.Context, cfg WireGuardConfig, endpoint string) 
 				// Transient datagram errors must not kill the pipe.
 				continue
 			}
-			_ = sent
 			pkt.DecRef()
+
+			// WritePacket returns any ICMP (e.g. Packet Too Big) the netstack
+			// must see; without injecting it PMTU feedback is discarded and
+			// the QUIC datagram send path can wedge on big uploads.
+			if len(icmp) > 0 {
+				proto := ipv6.ProtocolNumber
+				if int(icmp[0])>>4 == 4 {
+					proto = ipv4.ProtocolNumber
+				}
+				var icl buffer.Buffer
+				icl.Append(buffer.NewViewWithData(append([]byte(nil), icmp...)))
+				ique := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					Payload:            icl,
+					ReserveHeaderBytes: header.IPv6MinimumSize, // covers IPv4 too
+				})
+				ique.RXChecksumValidated = true
+				ique.NetworkProtocolNumber = proto
+				epCh.InjectInbound(proto, ique)
+				ique.DecRef()
+			}
 		}
 	}()
 

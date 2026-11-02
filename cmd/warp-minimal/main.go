@@ -33,7 +33,7 @@ func main() {
 	flag.Parse()
 
 	if *version {
-		fmt.Println("warp-minimal v0.1.0")
+		fmt.Println("warp-minimal v0.2.1")
 		return
 	}
 
@@ -75,25 +75,45 @@ func main() {
 		log.Printf("ERROR: cannot open log file %s: %v (stdout only)", logPath, err)
 	}
 
-	reg := warp.NewWGRegistrar()
-	pool, err := warp.NewWGPool(warp.PoolConfig{
-		PoolSize: cfg.PoolSize,
-		Stack:    cfg.Stack,
-	}, reg)
-	if err != nil {
-		log.Fatalf("create warp pool: %v", err)
+	// Pool agnóstico del stack: la familia masque (config "masque" o los
+	// valores de registro del pool MASQUE "ipv6"/"warp", que era como lo
+	// escribía la config del plugin v0.1.x) usa el pool MASQUE; cualquier
+	// otro valor mantiene el pool WireGuard exactamente como antes.
+	stackLabel := "wireguard"
+	var pool appPool
+	var egressPool warp.EgressPool
+	switch cfg.Stack {
+	case "masque", "ipv6", "warp":
+		stackLabel = "masque"
+		p, err := warp.NewPool(warp.PoolConfig{PoolSize: cfg.PoolSize})
+		if err != nil {
+			log.Fatalf("create warp pool: %v", err)
+		}
+		pool, egressPool = p, warp.MasquePoolEgress(p)
+	default:
+		reg := warp.NewWGRegistrar()
+		p, err := warp.NewWGPool(warp.PoolConfig{
+			PoolSize: cfg.PoolSize,
+			Stack:    cfg.Stack,
+		}, reg)
+		if err != nil {
+			log.Fatalf("create warp pool: %v", err)
+		}
+		pool, egressPool = p, warp.WGPoolEgress(p)
 	}
 	defer pool.Close()
 
+	proxy := warp.ProxyHandlerEgress(egressPool)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc(cfg.HealthPath, healthHandler(pool))
+	mux.HandleFunc(cfg.HealthPath, healthHandler(pool, stackLabel))
 	mux.HandleFunc("/recycle", recycleHandler(pool))
-	mux.HandleFunc("/", warp.ProxyHandler(pool))
+	mux.HandleFunc("/", proxy)
 
 	// Wrap mux so CONNECT requests (not routed by ServeMux) reach the proxy.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
-			warp.ProxyHandler(pool)(w, r)
+			proxy(w, r)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -142,12 +162,16 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func healthHandler(pool WGPoolStatuser) http.HandlerFunc {
+func healthHandler(pool WGPoolStatuser, stackLabel string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		status := pool.Status()
 		status["ok"] = true
 		status["service"] = "warp-minimal"
+		// El pool WG reporta su stack fijo; el MASQUE no lo incluye.
+		// Se reporta el tipo que construyó main para que el diagnóstico
+		// refleje la realidad.
+		status["stack"] = stackLabel
 		json.NewEncoder(w).Encode(status)
 	}
 }
@@ -174,7 +198,15 @@ func recycleHandler(pool WGPoolStatuser) http.HandlerFunc {
 }
 
 // WGPoolStatuser es la interfaz que expone wgPool: Status y RecycleAll.
+// *warp.Pool la satisface también (Status + RecycleAll).
 type WGPoolStatuser interface {
 	Status() map[string]any
 	RecycleAll() (started bool, status map[string]any)
+}
+
+// appPool es lo que main necesita del pool activo: los handlers de
+// /health y /recycle más Close para el defer de salida.
+type appPool interface {
+	WGPoolStatuser
+	Close()
 }
