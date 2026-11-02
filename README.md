@@ -96,12 +96,14 @@ go build -ldflags="-s -w" -o warp-minimal ./cmd/warp-minimal
 ./warp-minimal -config config.json
 ```
 
-### Verify the egress
+### Verify the egress (IPv6-only)
 ```bash
 curl -x http://127.0.0.1:8789 https://cloudflare.com/cdn-cgi/trace
-# ip=104.28.xx.xx        ← Cloudflare edge
-# warp=on                ← egress goes through the WARP tunnel ✅
+# ip=2a09:bac5:xxxx:xxxx::xxxx   ← Cloudflare WARP IPv6 (never 104.28.x.x)
+# warp=on                        ← egress goes through the WARP tunnel ✅
 ```
+
+> **IPv6-only guarantee:** with `stack: "ipv6"` the proxy rejects IPv4 addresses and never falls back to IPv4. If a domain has no AAAA record, the connection is refused instead of using the burned 104.28.x.x IPv4 gate range.
 
 ```bash
 curl -x http://127.0.0.1:8789 https://www.google.com -o /dev/null -w "%{http_code}\n"
@@ -125,7 +127,7 @@ curl -x http://127.0.0.1:8789 https://www.google.com -o /dev/null -w "%{http_cod
 |-------|---------|-------------|
 | `listen` | `127.0.0.1:8789` | HTTP proxy listen address |
 | `pool_size` | `2` | Concurrent WARP exits |
-| `stack` | `ipv6` | Egress stack: `masque` / `ipv6` / `warp` all select the MASQUE (QUIC) pool; `wireguard` selects the userspace WG tunnel |
+| `stack` | `ipv6` | Egress stack: `masque` / `ipv6` / `warp` all select the MASQUE (QUIC) pool; `wireguard` selects the userspace WG tunnel. `ipv6` forces IPv6-only egress (rejects IPv4, no fallback, avoids 104.28.x.x gate range) |
 | `health_path` | `/health` | Health endpoint path |
 
 ---
