@@ -7,9 +7,11 @@
 [![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](go.mod)
 [![Build](https://github.com/Deury08/warp-minimal/actions/workflows/release.yml/badge.svg)](https://github.com/Deury08/warp-minimal/actions)
 
+**Idioma / Language:** [Español](#configuración-y-uso-español) | [English](#english)
+
 ---
 
-## What is it?
+## What is it? <a name="english"></a>
 
 `warp-minimal` is a **minimal HTTP/HTTPS proxy** that routes outbound traffic through **Cloudflare WARP MASQUE tunnels** (userspace, no root, no TUN). Each request exits via a **different IPv6 /64**, automatically rotating when the upstream responds **429 (rate limit)**.
 
@@ -303,7 +305,7 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 
 ---
 
-## Configuración y uso (Español)
+## Configuración y uso (Español) <a name="español"></a>
 
 ### ¿Qué hace?
 
@@ -400,4 +402,6 @@ Respuesta esperada:
 | Las peticiones cuelgan, `/health` muestra salidas pero el proxy está muerto | Proceso viejo con sesión QUIC zombie todavía escuchando | `taskkill /F /IM warp-minimal.exe` y arrancar de nuevo |
 | `healthy: 0` al iniciar | UDP 443 a `162.159.198.2` bloqueado, o falló registro/enrolamiento | Revisar firewall; buscar `enroll failed` en los logs |
 | `PROTOCOL_VIOLATION (remote)` | Comportamiento transitorio del backend | Fixed by `ConnectionIDLength: 20`; el pool reintenta automáticamente |
+
+[⬆️ Volver a English](#english)
 
