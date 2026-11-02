@@ -300,3 +300,104 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 - Stubs ready for: Cloudflare registration, WireGuard tunnel, uTLS proxy
 - Release workflow: 6 targets + checksums + registry.json
 - MIT license + NOTICE
+
+---
+
+## Configuración y uso (Español)
+
+### ¿Qué hace?
+
+`warp-minimal` es un **proxy HTTP/HTTPS mínimo** que envía el tráfico saliente a través de túneles **Cloudflare WARP MASQUE** (userspace, sin root, sin TUN). Cada petición sale por una **IPv6 /64 distinta**, rotando automáticamente cuando el upstream responde **429 (rate limit)**.
+
+Con `stack: "ipv6"` el egress es **solo IPv6**: rechaza direcciones IPv4 y nunca hace fallback a IPv4, evitando el rango quemado `104.28.x.x` del gate IPv4.
+
+### Configuración rápida (`config.json`)
+
+```json
+{
+  "listen": "127.0.0.1:8789",
+  "pool_size": 2,
+  "stack": "ipv6",
+  "health_path": "/health"
+}
+```
+
+| Campo | Por defecto | Descripción |
+|-------|-------------|-------------|
+| `listen` | `127.0.0.1:8789` | Dirección de escucha del proxy HTTP |
+| `pool_size` | `2` | Cantidad de salidas WARP concurrentes |
+| `stack` | `ipv6` | Pila de egress: `masque` / `ipv6` / `warp` usan el pool MASQUE (QUIC); `wireguard` usa el túnel WG en userspace. `ipv6` fuerza egress solo IPv6 (rechaza IPv4, sin fallback, evita 104.28.x.x) |
+| `health_path` | `/health` | Ruta del endpoint de salud |
+
+### Construir y ejecutar
+
+```bash
+# Requiere Go 1.26+
+git clone https://github.com/Deury08/warp-minimal.git
+cd warp-minimal
+go build -ldflags="-s -w" -o warp-minimal ./cmd/warp-minimal
+./warp-minimal -config config.json
+```
+
+### Verificar el egress (IPv6 solo)
+
+```bash
+curl -x http://127.0.0.1:8789 https://cloudflare.com/cdn-cgi/trace
+# ip=2a09:bac5:xxxx:xxxx::xxxx   ← IPv6 de Cloudflare WARP (nunca 104.28.x.x)
+# warp=on                        ← egress por el túnel WARP ✅
+```
+
+> **Garantía IPv6-only:** con `stack: "ipv6"` el proxy rechaza direcciones IPv4 y nunca falla a IPv4. Si un dominio no tiene registro AAAA, la conexión se rechaza en lugar de usar el rango IPv4 quemado `104.28.x.x`.
+
+### Uso con cualquier cliente HTTP
+
+```bash
+# cURL
+curl -x http://127.0.0.1:8789 https://httpbin.org/ip
+# {"origin": "2a09:bac5:xxxx:xxxx::xxxx"}  ← IPv6 de Cloudflare WARP
+
+# wget
+wget -e use_proxy=yes -e https_proxy=http://127.0.0.1:8789 https://example.com
+
+# Python
+requests.get("https://api.example.com", proxies={"https": "http://127.0.0.1:8789"})
+
+# Node.js
+fetch("https://api.example.com", { dispatcher: new ProxyAgent("http://127.0.0.1:8789") })
+```
+
+### Health check
+
+```bash
+curl http://127.0.0.1:8789/health
+```
+
+Respuesta esperada:
+
+```json
+{
+  "ok": true,
+  "service": "warp-minimal",
+  "pool_size": 2,
+  "active": 2,
+  "healthy": 2,
+  "cooling_down": 0
+}
+```
+
+### Requisitos de red
+
+| Requisito | Detalle |
+|-----------|---------|
+| **UDP 443 saliente** | A `162.159.198.2` (o el endpoint asignado por el enrolamiento) — QUIC simple, sin puertos especiales |
+| **HTTPS saliente** | A `api.cloudflareclient.com` (registro + enrolamiento) |
+| **Sin root / TUN** | 100% userspace (quic-go + gVisor) |
+
+### Solución de problemas
+
+| Síntoma | Causa | Solución |
+|---------|-------|----------|
+| Las peticiones cuelgan, `/health` muestra salidas pero el proxy está muerto | Proceso viejo con sesión QUIC zombie todavía escuchando | `taskkill /F /IM warp-minimal.exe` y arrancar de nuevo |
+| `healthy: 0` al iniciar | UDP 443 a `162.159.198.2` bloqueado, o falló registro/enrolamiento | Revisar firewall; buscar `enroll failed` en los logs |
+| `PROTOCOL_VIOLATION (remote)` | Comportamiento transitorio del backend | Fixed by `ConnectionIDLength: 20`; el pool reintenta automáticamente |
+
