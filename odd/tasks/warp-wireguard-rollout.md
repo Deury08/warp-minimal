@@ -50,9 +50,15 @@ on large payloads, exits kept healthy, prove E2E.
 | T2 | Explore delegation: map usque flow-control/QUIC config vs our masque.go upload path; return root cause + fix plan with path:line evidence | delegated explore | pending |
 | T3 | Implement flow-control fix in internal/warp (go slice; RED repro test if feasible) | inline | done (code) |
 | T3.2 | Wire stack=masque into main.go: unified EgressPool interface in proxy.go + stack switch in main.go | delegated writer | done (code) |
-| T4 | Verify: unit tests green; standalone repro via local MASQUE proxy binary on test port: 64KB+ upload 200 OK, trace warp=on | inline | pending |
-| T5 | E2E through bridge: enable warp, big POST via relay, real round; no 502 | inline | pending |
+| T4 | Verify: unit tests green; standalone repro via local MASQUE proxy binary on test port: 64KB+ upload 200 OK, trace warp=on | inline | done — live 8793: 64KB 200@3.4s, 200KB 200@1.1s, 1MB 200@10.6s, warp=on, pool healthy |
+| T5 | E2E through bridge: enable warp, big POST via relay, real round; no 502 | inline | pending — needs deploy to plugin + warpEnabled on (user gate) |
 | T6 | Record results, tag v0.2.1 (incl. Acquire fix + RecycleAll + flow-control fix), update doc + memory | inline | pending |
+
+## Verification evidence
+
+- Commits: 00ccefe (recycle + hygiene), b022543 (flow fix + masque rewiring).
+- Review assess (average risk, base ac9fa63, committed-only): medium / review_due=false (under_budget).
+- Authors: parent builds only; two delegated writers implemented T3 and T3.2 with parent spot checks; live tests observed directly on port 8793.
 
 ## Verification checklist
 
