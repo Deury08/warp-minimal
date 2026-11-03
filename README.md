@@ -113,7 +113,7 @@ curl -x http://127.0.0.1:8789 https://cloudflare.com/cdn-cgi/trace
 # warp=on                        ← egress goes through the WARP tunnel ✅
 ```
 
-> **IPv6-only guarantee:** with `stack: "ipv6"` the proxy rejects IPv4 addresses and never falls back to IPv4. If a domain has no AAAA record, the connection is refused instead of using the burned 104.28.x.x IPv4 gate range.
+> **IPv6-only guarantee:** with `stack: "ipv6"` the proxy rejects IPv4 addresses and never falls back to IPv4. If a domain has no AAAA record, the connection is refused rather than silently exiting through the shared WARP IPv4 range.
 
 ```bash
 curl -x http://127.0.0.1:8789 https://www.google.com -o /dev/null -w "%{http_code}\n"
@@ -140,7 +140,7 @@ The binary ships with working defaults. **No config file is required**: with no
 |-------|---------|-------------|
 | `listen` | `127.0.0.1:8789` | HTTP proxy listen address |
 | `pool_size` | `2` | Concurrent WARP exits. MASQUE enrolls every exit at start, so this is also the startup enrollment count; `2` is one primary plus one warm standby |
-| `stack` | `ipv6` | Egress stack. `masque` / `ipv6` / `warp` all select the MASQUE (QUIC) pool — equivalent today, with `ipv6` kept for v0.1.x configs and for its IPv6-only guarantee (rejects IPv4, no fallback, avoids the burned 104.28.x.x range). `wireguard` selects the userspace WG tunnel (UDP 2408) as an explicit opt-in |
+| `stack` | `ipv6` | Egress stack. `masque` / `ipv6` / `warp` all select the MASQUE (QUIC) pool — equivalent today, with `ipv6` kept for v0.1.x configs and for its IPv6-only guarantee (rejects IPv4, no fallback, exits only through dedicated IPv6 addresses). `wireguard` selects the userspace WG tunnel (UDP 2408) as an explicit opt-in |
 | `health_path` | `/health` | Health endpoint path. Must start with `/` |
 | `log_path` | *(next to the binary)* | Where log lines are mirrored (`warp-minimal.log` beside the executable by default). Use an absolute path when the install directory is not writable |
 

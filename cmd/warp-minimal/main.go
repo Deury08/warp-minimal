@@ -41,10 +41,9 @@ const buildVersion = "v0.2.3"
 // CONNECT times out after 10s while /health still reports ok — a silent failure.
 // It stays available as the explicit `"stack": "wireguard"` opt-in.
 //
-// IPv6-only egress is also a quota decision: WARP's IPv4 egress comes from the
-// narrow, shared 104.28.x.x range that upstream gates burn quickly, while IPv6
-// exits come from a large reserved range and rotate to a genuinely fresh
-// address.
+// IPv6-only egress is also an isolation decision: each tunnel gets its own
+// dedicated IPv6 exit, so rotating an exit yields a genuinely new egress
+// address, while the WARP IPv4 side shares a narrow range across all sessions.
 const (
 	defaultListen     = "127.0.0.1:8789"
 	defaultPoolSize   = 2
