@@ -13,13 +13,13 @@
 
 ## ¿Qué es? <a name="readme-es"></a>
 
-`warp-minimal` es un **proxy HTTP/HTTPS mínimo** que envía el tráfico saliente a través de túneles **Cloudflare WARP MASQUE** (userspace, sin root, sin TUN). Cada petición sale por una **IPv6 /64 distinta**, rotando automáticamente cuando el upstream responde **429 (rate limit)**.
+`warp-minimal` es un **proxy HTTP/HTTPS mínimo** que envía el tráfico saliente a través de túneles **Cloudflare WARP MASQUE** (userspace, sin root, sin TUN). El tráfico sale por el egress IPv6 del pool y rota a una salida nueva cuando el upstream responde **429 (rate limit)**.
 
 No tiene dependencias de ningún proyecto específico — úsalo con cualquier cliente HTTP.
 
 ### ¿Por qué MASQUE (UDP 443)?
 
-MASQUE (QUIC Connect-IP) es el egress por defecto: es el mismo transporte que usa el cliente oficial 1.1.1.1, sobrevive a redes donde los handshakes de WireGuard son bloqueados por DPI (muchos ISP residenciales droppean selectivamente UDP 2408), y corre totalmente en userspace (quic-go + gVisor netstack — sin root, sin TUN). El descubrimiento de PMTU de QUIC (con tamaño de paquete inicial 1242 como piso) más el feedback de ICMP Packet-Too-Big al netstack mantienen subidas grandes (64KB+) fluyendo. El pool pre-carga la mitad de su tamaño (mínimo 1 salida caliente), rota inmediatamente ante HTTP 429/403 o errores de socket, y se auto-cura: un túnel muerto falla su salida y una nueva se registra automáticamente, reintentando con backoff exponencial (10s → 60s, 20 intentos) para que una falla transitoria de registro no deje el pool vacío.
+MASQUE (QUIC Connect-IP) es el egress por defecto: es el mismo transporte que usa el cliente oficial 1.1.1.1, sobrevive a redes donde los handshakes de WireGuard son bloqueados por DPI (muchos ISP residenciales droppean selectivamente UDP 2408), y corre totalmente en userspace (quic-go + gVisor netstack — sin root, sin TUN). El descubrimiento de PMTU de QUIC (con tamaño de paquete inicial 1242 como piso) más el feedback de ICMP Packet-Too-Big al netstack mantienen subidas grandes (64KB+) fluyendo. El pool MASQUE inscribe todas sus salidas al arrancar (el pool WireGuard pre-carga la mitad, mínimo 1), rota inmediatamente ante HTTP 429/403 o errores de socket, y se auto-cura: un túnel muerto falla su salida y una nueva se registra automáticamente, reintentando con backoff exponencial (10s → 60s, 20 intentos) para que una falla transitoria de registro no deje el pool vacío.
 
 El stack WireGuard en userspace (UDP 2408, keepalive 25s) permanece disponible como `"stack": "wireguard"` para redes donde los handshakes WG no son bloqueados.
 
@@ -30,7 +30,7 @@ El stack WireGuard en userspace (UDP 2408, keepalive 25s) permanece disponible c
 | Característica | Detalle |
 |----------------|---------|
 | **Egress MASQUE (QUIC / UDP 443)** | Registro → Enrolamiento de clave ECDSA P-256 → Túnel QUIC Connect-IP (quic-go + gVisor). WireGuard (UDP 2408) permanece como `stack: "wireguard"` fallback |
-| **Pool con pre-carga** | La mitad del pool (mínimo 1) caliente antes del primer tráfico; adquisición round-robin |
+| **Pool con pre-carga** | MASQUE inscribe el pool completo al arrancar (WireGuard pre-carga la mitad, mínimo 1). La adquisición toma la primera salida sana — las salidas se comparten entre flujos concurrentes, así que `pool_size: 2` es un primario más un respaldo caliente |
 | **Auto-rotación** | Descarte inmediato + re-registro en segundo plano ante HTTP 429/403 o error de socket |
 | **Cooldown por bloque de egress** | 30 min por /64 IPv6 o /32 IPv4 tras una falla |
 | **Keepalive inactivo** | QUIC PING cada 30s para mantener el mapping de NAT vivo bajo tráfico |
@@ -64,7 +64,7 @@ El stack WireGuard en userspace (UDP 2408, keepalive 25s) permanece disponible c
 git clone https://github.com/Deury08/warp-minimal.git
 cd warp-minimal
 go build -ldflags="-s -w" -o warp-minimal ./cmd/warp-minimal
-./warp-minimal -config config.json
+./warp-minimal                      # defaults: MASQUE, solo IPv6, pool 2, :8789
 ```
 
 ### Verificar el egress (solo IPv6)
@@ -84,7 +84,11 @@ curl -x http://127.0.0.1:8789 https://www.google.com -o /dev/null -w "%{http_cod
 
 ---
 
-## Configuración (`config.json`)
+## Configuración (`config.json` — opcional)
+
+El binario ya trae defaults que funcionan. **No hace falta ningún archivo de
+configuración**: sin `config.json` al lado, `warp-minimal` arranca con los
+valores de abajo.
 
 ```json
 {
@@ -98,9 +102,29 @@ curl -x http://127.0.0.1:8789 https://www.google.com -o /dev/null -w "%{http_cod
 | Campo | Por defecto | Descripción |
 |-------|-------------|-------------|
 | `listen` | `127.0.0.1:8789` | Dirección de escucha del proxy HTTP |
-| `pool_size` | `2` | Cantidad de salidas WARP concurrentes |
-| `stack` | `ipv6` | Pila de egress: `masque` / `ipv6` / `warp` usan el pool MASQUE (QUIC); `wireguard` usa el túnel WG en userspace. `ipv6` fuerza egress solo IPv6 (rechaza IPv4, sin fallback, evita 104.28.x.x) |
-| `health_path` | `/health` | Ruta del endpoint de salud |
+| `pool_size` | `2` | Salidas WARP concurrentes. MASQUE inscribe todas al arrancar, así que también es la cantidad de inscripciones iniciales; `2` es un primario más un respaldo caliente |
+| `stack` | `ipv6` | Pila de egress. `masque` / `ipv6` / `warp` usan el pool MASQUE (QUIC) — hoy equivalentes, con `ipv6` conservado por compatibilidad con configs v0.1.x y por su garantía solo IPv6 (rechaza IPv4, sin fallback, evita el rango quemado 104.28.x.x). `wireguard` usa el túnel WG en userspace (UDP 2408) como opt-in explícito |
+| `health_path` | `/health` | Ruta del endpoint de salud. Debe empezar con `/` |
+| `log_path` | *(junto al binario)* | Dónde se espejan los logs (`warp-minimal.log` junto al ejecutable por defecto). Conviene ruta absoluta si el directorio de instalación no es escribible |
+
+### Cómo sobrescribir valores
+
+El archivo es un **override**, no un requisito:
+
+- Un campo que omitís conserva su default, así que un archivo de una línea es válido: `{"pool_size": 4}`.
+- Poner un campo en su valor cero (`""`, `0`) también vuelve al default.
+- Un tipo equivocado es un error duro al arrancar (`json: cannot unmarshal ...`), mientras que una **clave desconocida se ignora en silencio** — imprimí la configuración efectiva en lugar de tipear nombres de campo a mano.
+- El archivo se lee **una sola vez al arrancar**; reiniciá para aplicar cambios. Un solo proceso puede tomar `listen`.
+
+```bash
+./warp-minimal -print-config        # config efectiva en JSON (defaults, o defaults + archivo)
+./warp-minimal -config mi.json      # override desde un archivo
+./warp-minimal -version
+```
+
+Copiá [`config.example.json`](config.example.json) como punto de partida. El log de
+arranque siempre dice qué fuente ganó: `config: config file: <ruta>`, o
+`config: config file: none at <ruta>; using built-in defaults`.
 
 ---
 
