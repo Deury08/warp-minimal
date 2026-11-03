@@ -7,5 +7,13 @@ config-test*.txt
 warp-test-*.exe
 warptest*.exe
 
+# Operator runtime override. The tracked reference is config.example.json;
+# config.json is whatever this install actually runs with.
+config.json
+
+# Build output of the documented build-then-swap flow (a running .exe cannot be
+# overwritten on Windows, so the new build lands under a separate name first).
+warp-minimal-new.exe
+
 # Local run artifacts
 *.err
