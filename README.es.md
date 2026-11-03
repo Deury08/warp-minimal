@@ -67,6 +67,14 @@ go build -ldflags="-s -w" -o warp-minimal ./cmd/warp-minimal
 ./warp-minimal                      # defaults: MASQUE, solo IPv6, pool 2, :8789
 ```
 
+> **No hace falta ningún archivo de configuración.** Esos defaults ya son la
+> configuración que funciona. Si necesitás cambiar algo — otro puerto, más salidas,
+> una red WireGuard, una ruta de log — creá un `config.json` junto al binario:
+> partí de [`config.example.json`](config.example.json) y editá sólo los campos que te
+> importan. Todo campo que omitas conserva su default, así que un archivo de una
+> línea es válido. Ver **Configuración** más abajo para la tabla de campos y las
+> reglas de override.
+
 ### Verificar el egress (solo IPv6)
 
 ```bash
@@ -108,6 +116,9 @@ valores de abajo.
 | `log_path` | *(junto al binario)* | Dónde se espejan los logs (`warp-minimal.log` junto al ejecutable por defecto). Conviene ruta absoluta si el directorio de instalación no es escribible |
 
 ### Cómo sobrescribir valores
+
+Para crear tu propio `config.json` (opcional): copiá `config.example.json` junto al
+binario y dejá sólo los campos que quieras cambiar. Reiniciá el proceso después.
 
 El archivo es un **override**, no un requisito:
 
