@@ -27,13 +27,51 @@ type Config struct {
 	LogPath string `json:"log_path"`
 }
 
+// buildVersion identifies the binary. It must move whenever new code could be
+// confused with an existing tag: a stale version string is how a WireGuard-only
+// build once shipped reporting "v0.1.0" while carrying newer code.
+const buildVersion = "v0.2.3"
+
+// Built-in defaults. They mirror config.example.json exactly (guarded by
+// TestExampleConfigMatchesDefaults) and describe the configuration this proxy
+// ships with: MASQUE over QUIC/UDP 443 with IPv6-only egress.
+//
+// WireGuard (UDP 2408) is deliberately NOT the default. On the networks this
+// tool targets the handshakes are dropped, the pool never fills, and every
+// CONNECT times out after 10s while /health still reports ok — a silent failure.
+// It stays available as the explicit `"stack": "wireguard"` opt-in.
+//
+// IPv6-only egress is also a quota decision: WARP's IPv4 egress comes from the
+// narrow, shared 104.28.x.x range that upstream gates burn quickly, while IPv6
+// exits come from a large reserved range and rotate to a genuinely fresh
+// address.
+const (
+	defaultListen     = "127.0.0.1:8789"
+	defaultPoolSize   = 2
+	defaultStack      = "ipv6"
+	defaultHealthPath = "/health"
+)
+
+// defaultConfig returns the built-in defaults as a value the file loader starts
+// from, so the loader, -print-config and the documented example all read from a
+// single source of truth.
+func defaultConfig() Config {
+	return Config{
+		Listen:     defaultListen,
+		PoolSize:   defaultPoolSize,
+		Stack:      defaultStack,
+		HealthPath: defaultHealthPath,
+	}
+}
+
 func main() {
 	configPath := flag.String("config", "config.json", "Path to config file")
 	version := flag.Bool("version", false, "Print version and exit")
+	printConfig := flag.Bool("print-config", false, "Print the effective config as JSON and exit")
 	flag.Parse()
 
 	if *version {
-		fmt.Println("warp-minimal v0.2.1")
+		fmt.Println("warp-minimal " + buildVersion)
 		return
 	}
 
@@ -42,17 +80,13 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	if cfg.Listen == "" {
-		cfg.Listen = "127.0.0.1:8789"
-	}
-	if cfg.PoolSize <= 0 {
-		cfg.PoolSize = 2
-	}
-	if cfg.Stack == "" {
-		cfg.Stack = "wireguard"
-	}
-	if cfg.HealthPath == "" {
-		cfg.HealthPath = "/health"
+	if *printConfig {
+		out, err := formatConfig(cfg)
+		if err != nil {
+			log.Fatalf("print config: %v", err)
+		}
+		fmt.Println(string(out))
+		return
 	}
 
 	// Persistent failure log: capture every diagnostic line (exact upstream
@@ -75,22 +109,22 @@ func main() {
 		log.Printf("ERROR: cannot open log file %s: %v (stdout only)", logPath, err)
 	}
 
-	// Pool agnóstico del stack: la familia masque (config "masque" o los
-	// valores de registro del pool MASQUE "ipv6"/"warp", que era como lo
-	// escribía la config del plugin v0.1.x) usa el pool MASQUE; cualquier
-	// otro valor mantiene el pool WireGuard exactamente como antes.
-	stackLabel := "wireguard"
+	// Say where the values came from. An absent config used to be
+	// indistinguishable from a configured one, which turned a broken stack
+	// default into a silent failure.
+	log.Printf("config: %s", describeConfigSource(*configPath, configFileExists(*configPath)))
+	log.Printf("config: stack=%s pool=%d listen=%s health=%s", cfg.Stack, cfg.PoolSize, cfg.Listen, cfg.HealthPath)
+
+	stackLabel, useMasque := stackFamily(cfg.Stack)
 	var pool appPool
 	var egressPool warp.EgressPool
-	switch cfg.Stack {
-	case "masque", "ipv6", "warp":
-		stackLabel = "masque"
+	if useMasque {
 		p, err := warp.NewPool(warp.PoolConfig{PoolSize: cfg.PoolSize})
 		if err != nil {
 			log.Fatalf("create warp pool: %v", err)
 		}
 		pool, egressPool = p, warp.MasquePoolEgress(p)
-	default:
+	} else {
 		reg := warp.NewWGRegistrar()
 		p, err := warp.NewWGPool(warp.PoolConfig{
 			PoolSize: cfg.PoolSize,
@@ -147,19 +181,79 @@ func main() {
 	log.Println("Server stopped")
 }
 
+// loadConfig resolves the effective configuration: start from the built-in
+// defaults, then let the file override only the fields it actually sets. A
+// missing file is not an error — the defaults are a supported, working
+// configuration — and a partial file is valid too.
 func loadConfig(path string) (*Config, error) {
+	cfg := defaultConfig()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &Config{}, nil
+		if !os.IsNotExist(err) {
+			return nil, err
 		}
-		return nil, err
+		return &cfg, nil
 	}
-	var cfg Config
+
+	// Unmarshalling over the prefilled struct keeps absent keys at their default.
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
+	normalize(&cfg)
 	return &cfg, nil
+}
+
+// normalize replaces zero values with the defaults. It covers JSON that sets a
+// key explicitly to its zero value (`"stack": ""`, `"pool_size": 0`), which
+// must behave like an absent key instead of running degraded.
+func normalize(cfg *Config) {
+	if cfg.Listen == "" {
+		cfg.Listen = defaultListen
+	}
+	if cfg.PoolSize <= 0 {
+		cfg.PoolSize = defaultPoolSize
+	}
+	if cfg.Stack == "" {
+		cfg.Stack = defaultStack
+	}
+	if cfg.HealthPath == "" {
+		cfg.HealthPath = defaultHealthPath
+	}
+}
+
+// stackFamily maps the configured stack value to the pool that serves it. The
+// MASQUE family is the default; "ipv6" and "warp" are aliases kept so v0.1.x
+// configs keep their meaning. Anything else keeps the WireGuard pool exactly as
+// before.
+func stackFamily(stack string) (label string, masque bool) {
+	switch stack {
+	case "", "masque", "ipv6", "warp":
+		return "masque", true
+	default:
+		return "wireguard", false
+	}
+}
+
+// configFileExists reports whether the config file is present. It only feeds the
+// startup diagnostic; read errors are already handled by loadConfig.
+func configFileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// describeConfigSource renders the startup line that tells the operator whether
+// the effective values came from a file or from the built-in defaults.
+func describeConfigSource(path string, exists bool) string {
+	if exists {
+		return "config file: " + path
+	}
+	return "config file: none at " + path + "; using built-in defaults"
+}
+
+// formatConfig renders the effective configuration as JSON for -print-config.
+func formatConfig(cfg *Config) ([]byte, error) {
+	return json.MarshalIndent(cfg, "", "  ")
 }
 
 func healthHandler(pool WGPoolStatuser, stackLabel string) http.HandlerFunc {

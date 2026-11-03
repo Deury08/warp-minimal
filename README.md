@@ -13,7 +13,7 @@
 
 ## What is it?
 
-`warp-minimal` is a **minimal HTTP/HTTPS proxy** that routes outbound traffic through **Cloudflare WARP MASQUE tunnels** (userspace, no root, no TUN). Each request exits via a **different IPv6 /64**, automatically rotating when the upstream responds **429 (rate limit)**.
+`warp-minimal` is a **minimal HTTP/HTTPS proxy** that routes outbound traffic through **Cloudflare WARP MASQUE tunnels** (userspace, no root, no TUN). Traffic exits via the pool's IPv6 egress and rotates to a fresh exit when the upstream responds **429 (rate limit)**.
 
 It has **zero dependencies on any specific project** — use it with any HTTP client.
 
@@ -25,8 +25,9 @@ are killed by DPI (many residential ISPs selectively drop UDP 2408), and it
 runs fully in userspace (quic-go + gVisor netstack — no root, no TUN). QUIC
 path-MTU discovery (with initial packet size 1242 as floor) plus ICMP
 Packet-Too-Big feedback into the netstack keep large uploads (64KB+) flowing.
-The pool preloads half its size (minimum 1 hot exit), rotates immediately on
-HTTP 429/403 or socket errors, and self-heals: a dead tunnel fails its exit and
+The MASQUE pool enrolls every configured exit at start (the WireGuard pool
+preloads half its size, minimum 1), rotates immediately on HTTP 429/403 or
+socket errors, and self-heals: a dead tunnel fails its exit and
 a replacement registers automatically, retrying with backoff (10s → 60s, 20
 attempts) so a transient registration failure cannot leave the pool empty.
 
@@ -40,7 +41,7 @@ The userspace WireGuard stack (UDP 2408, 25s keepalive) remains available as
 | Feature | Detail |
 |---------|--------|
 | **MASQUE egress (QUIC / UDP 443)** | Register → ECDSA P-256 device enrollment → QUIC Connect-IP tunnel (quic-go + gVisor). WireGuard (UDP 2408) remains as `stack: "wireguard"` fallback |
-| **Pool with preload** | Half the pool (min 1) hot before first traffic; round-robin acquisition |
+| **Pool with preload** | MASQUE enrolls the whole pool at start (WireGuard preloads half, min 1). Acquisition takes the first healthy exit — exits are shared by concurrent flows, so `pool_size: 2` is one primary plus one warm standby |
 | **Auto-rotation** | Immediate drop + background re-register on HTTP 429/403 or socket error |
 | **Cooldown per egress block** | 30 min per /64 IPv6 or /32 IPv4 after a failure |
 | **Idle keepalive** | 30s QUIC PING so the NAT mapping stays alive under traffic |
@@ -95,8 +96,15 @@ The userspace WireGuard stack (UDP 2408, 25s keepalive) remains available as
 git clone https://github.com/Deury08/warp-minimal.git
 cd warp-minimal
 go build -ldflags="-s -w" -o warp-minimal ./cmd/warp-minimal
-./warp-minimal -config config.json
+./warp-minimal                      # built-in defaults: MASQUE, IPv6-only, pool 2, :8789
 ```
+
+> **No config file needed.** Those defaults are the working configuration. If you do
+> need to change something — a different port, more exits, a WireGuard network, a log
+> path — create a `config.json` next to the binary: start from
+> [`config.example.json`](config.example.json) and edit only the fields you care
+> about. Every field you leave out keeps its default, so a one-line file is valid.
+> See **Configuration** below for the field table and the override rules.
 
 ### Verify the egress (IPv6-only)
 ```bash
@@ -114,7 +122,10 @@ curl -x http://127.0.0.1:8789 https://www.google.com -o /dev/null -w "%{http_cod
 
 ---
 
-## Configuration (`config.json`)
+## Configuration (`config.json` — optional)
+
+The binary ships with working defaults. **No config file is required**: with no
+`config.json` next to it, `warp-minimal` starts with the values below.
 
 ```json
 {
@@ -128,9 +139,35 @@ curl -x http://127.0.0.1:8789 https://www.google.com -o /dev/null -w "%{http_cod
 | Field | Default | Description |
 |-------|---------|-------------|
 | `listen` | `127.0.0.1:8789` | HTTP proxy listen address |
-| `pool_size` | `2` | Concurrent WARP exits |
-| `stack` | `ipv6` | Egress stack: `masque` / `ipv6` / `warp` all select the MASQUE (QUIC) pool; `wireguard` selects the userspace WG tunnel. `ipv6` forces IPv6-only egress (rejects IPv4, no fallback, avoids 104.28.x.x gate range) |
-| `health_path` | `/health` | Health endpoint path |
+| `pool_size` | `2` | Concurrent WARP exits. MASQUE enrolls every exit at start, so this is also the startup enrollment count; `2` is one primary plus one warm standby |
+| `stack` | `ipv6` | Egress stack. `masque` / `ipv6` / `warp` all select the MASQUE (QUIC) pool — equivalent today, with `ipv6` kept for v0.1.x configs and for its IPv6-only guarantee (rejects IPv4, no fallback, avoids the burned 104.28.x.x range). `wireguard` selects the userspace WG tunnel (UDP 2408) as an explicit opt-in |
+| `health_path` | `/health` | Health endpoint path. Must start with `/` |
+| `log_path` | *(next to the binary)* | Where log lines are mirrored (`warp-minimal.log` beside the executable by default). Use an absolute path when the install directory is not writable |
+
+### Overriding values
+
+To create your own `config.json` (optional): copy `config.example.json` next to the
+binary and keep only the fields you want to change. Restart the process afterwards.
+
+The file is an **override**, not a requirement:
+
+- A field you omit keeps its default, so a one-line file is valid: `{"pool_size": 4}`.
+- Setting a field to its zero value (`""`, `0`) also falls back to the default.
+- A wrong type is a hard error at startup (`json: cannot unmarshal ...`), while an
+  **unknown key is silently ignored** — print the effective config instead of
+  hand-typing field names to avoid that trap.
+- The file is read **once at startup**; restart to apply changes. Only one process
+  can hold `listen`.
+
+```bash
+./warp-minimal -print-config        # effective config as JSON (defaults, or defaults + file)
+./warp-minimal -config my.json      # override from a file
+./warp-minimal -version
+```
+
+Copy [`config.example.json`](config.example.json) as a starting point. The startup
+log always states which source won: `config: config file: <path>`, or
+`config: config file: none at <path>; using built-in defaults`.
 
 ---
 
@@ -281,6 +318,15 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 ---
 
 ## Changelog
+
+### v0.2.3 (2026-11-03)
+- **Config is now optional and the defaults are the working configuration**: `stack` defaults to MASQUE (`ipv6`), so a binary with no `config.json` starts on QUIC/UDP 443 instead of the WireGuard stack that silent-fails on networks blocking UDP 2408 (`acquire failed ... 10s` while `/health` still answered `ok`)
+- Defaults moved into one source of truth (`defaultConfig`) and applied by the loader, so a partial `config.json` overrides only the fields it sets and explicit zero values fall back instead of running degraded
+- `-print-config` prints the effective configuration as JSON and exits
+- Startup log states the config source (`config file: <path>` or `none at <path>; using built-in defaults`) and the effective values
+- `config.json` renamed to `config.example.json` (reference only) with a drift test pinning it to the built-in defaults
+- Docs corrected: `log_path` documented, pool acquisition described as first-healthy-exit (exits are shared; there is no round-robin), MASQUE enrols the whole pool at start while WireGuard preloads half
+- `-version` reports `v0.2.3`
 
 ### v0.2.1 (2026-11-02)
 - **Large MASQUE uploads fixed (≥64KB no longer stall ~15s)**: QUIC path-MTU discovery enabled (1242B floor instead of fixed Mickey-Mouse packets), ICMP Packet-Too-Big relayed into the gVisor netstack, keepalive 10s → 30s; quic-go pinned v0.60.0
