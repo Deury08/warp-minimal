@@ -117,6 +117,27 @@ La respuesta CONNECT incluye `X-Warp-Exit: warp-<hex>`.
   `POST /swap` → `202`, después `warp-18e52584cc62f704` (nueva) y `warp-18e5257cea30a874` (intacta),
   `404`/`405` correctos, log `drained, re-enrolling that exit only`.
 
+## Restricciones operativas (vigentes)
+
+El proxy de `127.0.0.1:8789` y el relay son el transporte de las propias sesiones que
+trabajan en esto: cerrar cualquiera de los dos corta a ambos agentes. Regla del dueño:
+se construye, pero toda prueba que pueda tumbar uno de los dos queda **pendiente hasta
+que él avise**.
+
+- **Permitido contra 8789:** solo `GET /health` (lectura pura).
+- **Diferido:** `POST /recycle` (corta los streams en vuelo → tumba el bridge),
+  `POST /swap` (drena una salida y quema un enrolamiento), recompilar/reiniciar el
+  8789, y levantar otra instancia del binario: no toca el 8789, pero enrola
+  dispositivos propios y compite por el mismo rate limit, así que puede dejar al pool
+  vivo sin poder reemplazar salidas. Es un riesgo indirecto, no nulo.
+- **Permitido siempre:** código, tests, fixtures, `go vet`, `go test` y leer archivos.
+- **En la frontera:** si una prueba parece segura pero roza la línea, se pregunta antes
+  de correrla. Vale en las dos direcciones (agente ↔ agente).
+
+Consecuencia: la verificación de aceptación 1-4 del relay espera el deploy, y mientras
+tanto se hace con fixtures. Las transiciones de estado de `/health` (`draining`,
+`healthy` cayendo a 1) son justamente lo que las fixtures no prueban.
+
 ## Log
 
 - **L1** Pedido del dueño: que el pool no se quede con una sola salida y que el relay pueda rotar
