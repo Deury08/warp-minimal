@@ -68,6 +68,25 @@ vez de esperar un delta por request. Si algún día hace falta atribución exact
 concurrencia o con varios clientes, la vía sería un registro de túneles nuevos
 (`GET /egress?since=<n>`): hoy no hace falta y no está implementado.
 
+**Reglas del consumidor (acordadas con el relay).** La atribución vive del lado del
+relay, porque solo él sabe si su túnel sigue vivo:
+
+1. Aprende únicamente en una ventana donde su propio intento abrió túnel: mapa
+   vacío, intento anterior caído a nivel transporte, o swap recién pedido (el drain
+   mata ese túnel).
+2. En esa ventana exige delta total == 1; 0 o 2+ dejan el mapa dudoso.
+3. Con mapa válido y túnel vivo, cualquier delta es de otro cliente: se ignora y
+   nunca sobreescribe el mapa. **Esta es la regla que separa**: `delta == 1` solo no
+   alcanza, porque un CONNECT ajeno también da 1.
+4. Mapa dudoso al decidir → no rota, aplica retry-after puro. El escape manual existe
+   fuera de esto (`/free-bridge-warp-recycle`, del lado del relay).
+5. Delta sobre su propio exit con su túnel vivo → contradicción → knockout del mapa
+   (conservador: cuesta un ciclo sin atribución, que la política ya absorbe).
+
+Costo del error, acotado por diseño: un swap equivocado es 1 enrolamiento y un drain,
+sin pérdida de datos ni streams cortados, y `fill` vuelve a `pool_size`. Por eso
+"ante duda, no rotar" alcanza y no hace falta superficie nueva en el proxy.
+
 La respuesta CONNECT incluye `X-Warp-Exit: warp-<hex>`.
 
 ## Tasks
