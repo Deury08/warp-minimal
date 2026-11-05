@@ -431,3 +431,21 @@ func TestSwapReportsInflightTarget(t *testing.T) {
 	setStreams(p, target, 0)
 	waitHealthy(t, p, 2)
 }
+
+// TestDrainingOutranksCooldownInStatus pins the state the relay infers "swap in
+// progress" from: an exit being swapped reports draining even if its tunnel also
+// died mid-swap, because otherwise the state disappears while the swap is still
+// running and the consumer thinks it finished.
+func TestDrainingOutranksCooldownInStatus(t *testing.T) {
+	p := swapPool(t, 2)
+
+	p.mu.Lock()
+	p.exits[0].draining = true
+	p.exits[0].Cooldown = time.Now().Add(time.Minute)
+	exits := p.statusLocked()["exits"].([]string)
+	p.mu.Unlock()
+
+	if !strings.Contains(exits[0], "draining") {
+		t.Fatalf("exits[0] = %q, want draining (a swap in flight outranks cooldown)", exits[0])
+	}
+}

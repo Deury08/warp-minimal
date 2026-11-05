@@ -592,10 +592,13 @@ func (p *Pool) statusLocked() map[string]any {
 		streams := e.streams
 		served := e.servedCount()
 		switch {
-		case !e.Cooldown.IsZero():
-			status = "cooldown"
+		// draining goes first: a swap in flight is the dominant fact, and the
+		// consumer infers "swap in progress" from this state. If the draining
+		// exit's tunnel dies mid-swap, cooldown must not hide it.
 		case e.draining:
 			status = "draining"
+		case !e.Cooldown.IsZero():
+			status = "cooldown"
 		case e.Tunnel() == nil:
 			status = "starting"
 		case streams > 0:
