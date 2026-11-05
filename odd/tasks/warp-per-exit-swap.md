@@ -57,7 +57,16 @@ monótono) y `streams` (abiertos ahora).
 la atribución se hace con `served`: snapshot de `/health`, un intento, snapshot de
 nuevo; el exit cuyo `served` subió es el que sirvió la request. Vale para intentos
 serializados: con varios en vuelo el delta puede nombrar más de un exit y deja de
-ser exacto.
+ser exacto. Y asume que el relay es el único cliente que abre CONNECT contra el
+proxy: cualquier otro proceso que use el 8789 también mueve `served` y contamina
+el delta (misma ambigüedad, otra fuente).
+
+Además, Bun reusa el CONNECT (medido por el relay: 3 fetches secuenciales → 1 solo
+túnel), así que `served` marca la apertura del túnel y no cada request que viaja
+por él. Por eso el consumidor cachea túnel→exit y aprende la salida del delta, en
+vez de esperar un delta por request. Si algún día hace falta atribución exacta con
+concurrencia o con varios clientes, la vía sería un registro de túneles nuevos
+(`GET /egress?since=<n>`): hoy no hace falta y no está implementado.
 
 La respuesta CONNECT incluye `X-Warp-Exit: warp-<hex>`.
 
