@@ -87,6 +87,20 @@ Costo del error, acotado por diseño: un swap equivocado es 1 enrolamiento y un 
 sin pérdida de datos ni streams cortados, y `fill` vuelve a `pool_size`. Por eso
 "ante duda, no rotar" alcanza y no hace falta superficie nueva en el proxy.
 
+Bodies reales, con las claves exactas y sin alias:
+
+```json
+202 {"ok":true,  "swapping":true, "target":"warp-18e...", "pool_size":2, "active":2, "healthy":1, "exits":[...]}
+202 {"ok":false, "swapping":true, "target":"warp-18e...", ...}   // no-op: ya había un recycle o swap en vuelo
+409 {"ok":false, "error":"no_standby", "target":"warp-18e...", ...}
+404 {"ok":false, "error":"unknown_exit", ...}                     // sin target: no hay id que nombrar
+405 y 501: texto plano, NO JSON
+```
+
+La clave es **`error`**, no `reason`. `reason` sólo existe como variable interna en Go
+(`Swap` devuelve `(started, status, reason)`), y esa discrepancia ya confundió a un
+consumidor una vez. Un alias `reason` en el body sería una segunda verdad: no existe.
+
 La respuesta CONNECT incluye `X-Warp-Exit: warp-<hex>`.
 
 ## Tasks
