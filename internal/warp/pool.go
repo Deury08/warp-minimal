@@ -53,7 +53,8 @@ type Pool struct {
 	healthy     int
 	coolingDown int
 	recycling   bool // a recycle is creating fresh exits; never double-run
-	swapping    bool // a per-exit swap is draining/re-enrolling; never double-run
+	swapping    bool   // a per-exit swap is draining/re-enrolling; never double-run
+	swapTarget  string // id of the exit the in-flight swap is draining; "" when none
 	retrying    map[*Exit]bool
 	stopped     chan struct{}
 	closeOnce   sync.Once
@@ -406,6 +407,9 @@ func (p *Pool) Swap(targetID string) (started bool, status map[string]any, reaso
 	p.mu.Lock()
 	if p.recycling || p.swapping {
 		s := p.statusLocked()
+		// Report the target of the swap already in flight, so a caller that gets
+		// the idempotent 202 never has to guess which exit was taken.
+		s["target"] = p.swapTarget
 		p.mu.Unlock()
 		return false, s, ""
 	}
@@ -436,14 +440,17 @@ func (p *Pool) Swap(targetID string) (started bool, status map[string]any, reaso
 
 	if !p.usableLocked(target) || !p.hasStandbyLocked(target) {
 		s := p.statusLocked()
+		s["target"] = target.ID
 		p.mu.Unlock()
 		return false, s, "no_standby"
 	}
 
 	target.draining = true
 	p.swapping = true
+	p.swapTarget = target.ID
 	p.recountLocked()
 	s := p.statusLocked()
+	s["target"] = target.ID
 	p.mu.Unlock()
 
 	log.Printf("WARP swap requested for %s: draining before re-enrolling that exit only", target.ID)
@@ -455,6 +462,7 @@ func (p *Pool) completeSwap(target *Exit) {
 	defer func() {
 		p.mu.Lock()
 		p.swapping = false
+		p.swapTarget = ""
 		p.mu.Unlock()
 	}()
 

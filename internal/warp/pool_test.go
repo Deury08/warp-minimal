@@ -339,6 +339,9 @@ func TestSwapDrainsThenReplacesOnlyTarget(t *testing.T) {
 	if exitAt(p, 0) == target {
 		t.Fatalf("target was never re-enrolled after draining: %v", p.Status())
 	}
+	if got := exitAt(p, 0).ID; got == target.ID {
+		t.Fatalf("re-enrolled exit reused the id %q; the relay confirms rotation by comparing ids", got)
+	}
 	if exitAt(p, 1) != standby {
 		t.Fatal("the standby exit was replaced too; a swap must touch exactly one exit")
 	}
@@ -390,4 +393,41 @@ func TestStatusReportsServedPerExit(t *testing.T) {
 	if got := second.servedCount(); got != 0 {
 		t.Fatalf("the standby exit counted %d tunnels, want 0", got)
 	}
+}
+
+// TestSwapReportsAcceptedTarget pins the 202 body the relay parses: it must name
+// the exit the swap actually took, so the caller never guesses.
+func TestSwapReportsAcceptedTarget(t *testing.T) {
+	p := swapPool(t, 2)
+	target := exitAt(p, 0)
+	defer setStreams(p, target, 0)
+
+	started, status, reason := p.Swap(target.ID)
+	if !started || reason != "" {
+		t.Fatalf("Swap = started %v reason %q; want true and no reason", started, reason)
+	}
+	if got := status["target"]; got != target.ID {
+		t.Fatalf("status[target] = %v, want %q", got, target.ID)
+	}
+	setStreams(p, target, 0)
+	waitHealthy(t, p, 2)
+}
+
+// TestSwapReportsInflightTarget pins that the idempotent 202 names the exit
+// already being swapped instead of an empty value.
+func TestSwapReportsInflightTarget(t *testing.T) {
+	p := swapPool(t, 2)
+	target := exitAt(p, 0)
+	setStreams(p, target, 1)
+
+	if started, _, _ := p.Swap(target.ID); !started {
+		t.Fatal("first swap did not start")
+	}
+	_, status, _ := p.Swap(target.ID)
+	if got := status["target"]; got != target.ID {
+		t.Fatalf("status[target] = %v during the in-flight swap, want %q", got, target.ID)
+	}
+
+	setStreams(p, target, 0)
+	waitHealthy(t, p, 2)
 }

@@ -32,7 +32,7 @@ operador recompile y reinicie.
 
 ```
 POST /swap                     cuerpo opcional {"exit":"warp-<hex>"}
-202  swap iniciado, o ya en vuelo (idempotente)
+202  swap iniciado, o ya en vuelo (idempotente). El body trae "target": "<id aceptado>"
 409  no_standby    — la swap dejaría el pool sin salida usable
 404  unknown_exit  — el id no está en el pool
 405  método no POST
@@ -40,6 +40,14 @@ POST /swap                     cuerpo opcional {"exit":"warp-<hex>"}
 ```
 
 Cuerpo vacío: se elige la salida con más streams (la más probablemente limitada).
+
+**Formato estable de `exits[]`:** `"<id completo> (<estado>, served=N, streams=N)"` —
+siempre esos tres campos, en ese orden, sin campos opcionales. Es lo que el relay parsea.
+
+**Cada enrolamiento emite un id NUEVO** (`warp-<hex>`); un swap no reusa el id, lo
+reemplaza. Por eso la rotación se confirma comparando ids completos: si el id cambió,
+la salida es nueva. (Corrección de una frase confusa del primer handover, que decía "el
+id culpable reaparece": lo que reaparece es el asiento, con id nuevo.)
 `GET /health` lista `exits` con el id completo, el estado (`healthy`, `in_use`,
 `draining`, `cooldown`, `starting`), `served` (túneles CONNECT establecidos,
 monótono) y `streams` (abiertos ahora).
