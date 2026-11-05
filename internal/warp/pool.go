@@ -582,6 +582,7 @@ func (p *Pool) statusLocked() map[string]any {
 	for i, e := range p.exits {
 		status := "healthy"
 		streams := e.streams
+		served := e.servedCount()
 		switch {
 		case !e.Cooldown.IsZero():
 			status = "cooldown"
@@ -592,7 +593,7 @@ func (p *Pool) statusLocked() map[string]any {
 		case streams > 0:
 			status = "in_use"
 		}
-		exits[i] = fmt.Sprintf("%s (%s, streams=%d)", e.ID, status, streams)
+		exits[i] = fmt.Sprintf("%s (%s, served=%d, streams=%d)", e.ID, status, served, streams)
 	}
 
 	return map[string]any{

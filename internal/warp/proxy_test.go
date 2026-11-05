@@ -14,8 +14,9 @@ import (
 // stubEgress is an EgressDialer with a fixed id and an injected dial, so this
 // test never touches a real tunnel.
 type stubEgress struct {
-	id   string
-	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	id     string
+	served int
+	dial   func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 func (s stubEgress) ID() string { return s.id }
@@ -23,6 +24,10 @@ func (s stubEgress) ID() string { return s.id }
 func (s stubEgress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return s.dial(ctx, network, addr)
 }
+
+// noteServed makes this stub a servedNoter, so the test can prove the proxy
+// counts each tunnel it establishes on the exit that dialed it.
+func (s *stubEgress) noteServed() { s.served++ }
 
 // stubEgressPool hands out one exit that is never released for real.
 type stubEgressPool struct{ exit EgressDialer }
@@ -54,7 +59,7 @@ func TestConnectReplyCarriesEgressID(t *testing.T) {
 	}()
 
 	const wantID = "warp-18e5257c545b2e64"
-	exit := stubEgress{
+	exit := &stubEgress{
 		id: wantID,
 		dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return net.Dial(network, upstream.Addr().String())
@@ -87,5 +92,8 @@ func TestConnectReplyCarriesEgressID(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Warp-Exit"); got != wantID {
 		t.Fatalf("X-Warp-Exit = %q, want %q (without the full id the relay cannot attribute a failure)", got, wantID)
+	}
+	if exit.served != 1 {
+		t.Fatalf("served = %d after one CONNECT, want 1 (the snapshot diff needs this count)", exit.served)
 	}
 }

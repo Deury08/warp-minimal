@@ -138,6 +138,11 @@ func ProxyHandlerEgress(pool EgressPool) http.HandlerFunc {
 }
 
 // handleConnect establece un túnel TCP a través de un exit WARP para tráfico HTTPS.
+// servedNoter is the optional ability to count the tunnels an exit carried, so
+// /health can expose a monotonic per-exit counter (used by clients whose HTTP
+// stack hides the CONNECT reply and cannot read X-Warp-Exit).
+type servedNoter interface{ noteServed() }
+
 func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, failer failable) {
 	ctx := r.Context()
 
@@ -163,6 +168,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, fail
 		http.Error(w, fmt.Sprintf("WARP dial failed: %v", err), http.StatusBadGateway)
 		failExit(failer, exit, err.Error())
 		return
+	}
+
+	// Attribution for clients that cannot read this reply (Bun's fetch builds the
+	// CONNECT itself and hides it): count the tunnel on the exit that dialed, so
+	// /health can be diffed around one attempt.
+	if noter, ok := exit.(servedNoter); ok {
+		noter.noteServed()
 	}
 
 	// Señal de establecimiento exitoso del túnel.

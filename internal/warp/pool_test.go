@@ -369,3 +369,25 @@ func TestSwapIsIdempotentWhileDraining(t *testing.T) {
 	setStreams(p, target, 0)
 	waitHealthy(t, p, 2)
 }
+
+// TestStatusReportsServedPerExit pins the counter the relay uses instead of the
+// CONNECT header (its HTTP stack hides that reply): /health must show a
+// monotonic served count per exit, so a snapshot diff around one attempt names
+// the exit that carried it.
+func TestStatusReportsServedPerExit(t *testing.T) {
+	p := swapPool(t, 2)
+	first, second := exitAt(p, 0), exitAt(p, 1)
+	first.noteServed()
+	first.noteServed()
+
+	exits := p.Status()["exits"].([]string)
+	if !strings.Contains(exits[0], "served=2") {
+		t.Fatalf("exits[0] = %q, want served=2", exits[0])
+	}
+	if !strings.Contains(exits[1], "served=0") {
+		t.Fatalf("exits[1] = %q, want served=0 (only the exit that served may count)", exits[1])
+	}
+	if got := second.servedCount(); got != 0 {
+		t.Fatalf("the standby exit counted %d tunnels, want 0", got)
+	}
+}

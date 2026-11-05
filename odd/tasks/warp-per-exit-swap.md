@@ -41,7 +41,15 @@ POST /swap                     cuerpo opcional {"exit":"warp-<hex>"}
 
 Cuerpo vacío: se elige la salida con más streams (la más probablemente limitada).
 `GET /health` lista `exits` con el id completo, el estado (`healthy`, `in_use`,
-`draining`, `cooldown`, `starting`) y `streams`.
+`draining`, `cooldown`, `starting`), `served` (túneles CONNECT establecidos,
+monótono) y `streams` (abiertos ahora).
+
+**Atribución sin leer el CONNECT.** Si el cliente arma el CONNECT por dentro (el
+`fetch` de Bun lo hace y esconde la respuesta), el header no le llega. En ese caso
+la atribución se hace con `served`: snapshot de `/health`, un intento, snapshot de
+nuevo; el exit cuyo `served` subió es el que sirvió la request. Vale para intentos
+serializados: con varios en vuelo el delta puede nombrar más de un exit y deja de
+ser exacto.
 
 La respuesta CONNECT incluye `X-Warp-Exit: warp-<hex>`.
 
@@ -54,12 +62,17 @@ La respuesta CONNECT incluye `X-Warp-Exit: warp-<hex>`.
 | T3 | S4 | `pool.go` — `swapping` + guarda en `Swap`/`RecycleAll` | `c34e209` |
 | T4 | S2 | `internal/warp/proxy.go` — `X-Warp-Exit` en el CONNECT | `209dd95` |
 | T5 | S1-S5 | `cmd/warp-minimal/main.go` — `swapHandler` y ruta `/swap` | `209dd95` |
+| T6 | S2 | `types.go`, `proxy.go`, `pool.go` — contador `served` por exit en `/health` | este commit |
 
 ## Evidencia
 
 - `internal/warp/pool_test.go`: `TestSwapRefusesLastHealthy`, `TestSwapDrainsThenReplacesOnlyTarget`,
   `TestSwapUnknownExit`, `TestSwapIsIdempotentWhileDraining`.
-- `internal/warp/proxy_test.go`: `TestConnectReplyCarriesEgressID`.
+- `internal/warp/proxy_test.go`: `TestConnectReplyCarriesEgressID` (también prueba que un CONNECT suma
+  exactamente 1 en `served` del exit que dialeó).
+- `internal/warp/pool_test.go`: `TestStatusReportsServedPerExit`.
+- Mutaciones del contador: sacar `noteServed()` → el test falla con `served = 0`; cambiar el nombre del
+  campo en `/health` → el test falla. Ambas restauradas.
 - Mutaciones verificadas (cada una rompe un test y se restauró):
   M1 sin guarda de standby → el pool llega a `healthy:0`; M2 sin espera de drenado → el reemplazo
   ocurre con el stream vivo; M3 sin header → `X-Warp-Exit = ""`.
