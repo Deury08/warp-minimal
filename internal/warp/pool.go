@@ -11,8 +11,6 @@ import (
 const (
 	cooldownDuration    = 30 * time.Minute
 	registrationTimeout = 30 * time.Second
-	maxRetries          = 3
-	retryDelay          = 5 * time.Second
 
 	// Replacement retry: after createExit fails once (e.g. transient DNS
 	// outage), retry with exponential backoff 10s -> 60s cap, up to 20
@@ -20,7 +18,33 @@ const (
 	replaceRetryInitial  = 10 * time.Second
 	replaceRetryMaxDelay = 60 * time.Second
 	replaceRetryAttempts = 20
+
+	// Fill retry logging: keep detail for the first attempts, then only every
+	// 10th. The fill path retries forever, so a long WARP outage must not flood
+	// the log for as long as it lasts.
+	fillLogFirst = 5
+	fillLogEvery = 10
+
+	// Swap drain: how long a swapped-out exit may keep serving its live streams
+	// before it is re-enrolled anyway. Best effort by design — a stream that
+	// never ends must not pin the slot forever.
+	drainTimeout = 120 * time.Second
 )
+
+// exitFactory enrolls one exit. Production uses Pool.createExit; tests inject a
+// fake so pool behavior (fill, retry, failover) is pinned without WARP.
+type exitFactory func(context.Context) (*Exit, error)
+
+// poolOptions carries test seams. The zero value is production behavior.
+type poolOptions struct {
+	factory          exitFactory
+	fillRetryInitial time.Duration
+	fillRetryMax     time.Duration
+
+	replaceAttempts int
+	replaceInitial  time.Duration
+	replaceMax      time.Duration
+}
 
 type Pool struct {
 	mu          sync.Mutex
@@ -29,49 +53,93 @@ type Pool struct {
 	healthy     int
 	coolingDown int
 	recycling   bool // a recycle is creating fresh exits; never double-run
+	swapping    bool // a per-exit swap is draining/re-enrolling; never double-run
 	retrying    map[*Exit]bool
 	stopped     chan struct{}
 	closeOnce   sync.Once
+
+	factory          exitFactory
+	fillRetryInitial time.Duration
+	fillRetryMax     time.Duration
+
+	replaceAttempts int
+	replaceInitial  time.Duration
+	replaceMax      time.Duration
 }
 
-func NewPool(cfg PoolConfig) (*Pool, error) {
+func NewPool(cfg PoolConfig) (*Pool, error) { return newPoolWith(cfg, poolOptions{}), nil }
+
+func newPoolWith(cfg PoolConfig, opt poolOptions) *Pool {
 	if cfg.PoolSize <= 0 {
 		cfg.PoolSize = 2
 	}
 	if cfg.Stack == "" {
 		cfg.Stack = "ipv6"
 	}
+	if opt.fillRetryInitial <= 0 {
+		opt.fillRetryInitial = replaceRetryInitial
+	}
+	if opt.fillRetryMax <= 0 {
+		opt.fillRetryMax = replaceRetryMaxDelay
+	}
+	if opt.replaceAttempts <= 0 {
+		opt.replaceAttempts = replaceRetryAttempts
+	}
+	if opt.replaceInitial <= 0 {
+		opt.replaceInitial = replaceRetryInitial
+	}
+	if opt.replaceMax <= 0 {
+		opt.replaceMax = replaceRetryMaxDelay
+	}
 
 	p := &Pool{
-		config:   cfg,
-		exits:    make([]*Exit, 0, cfg.PoolSize),
-		retrying: make(map[*Exit]bool),
-		stopped:  make(chan struct{}),
+		config:           cfg,
+		exits:            make([]*Exit, 0, cfg.PoolSize),
+		retrying:         make(map[*Exit]bool),
+		stopped:          make(chan struct{}),
+		factory:          opt.factory,
+		fillRetryInitial: opt.fillRetryInitial,
+		fillRetryMax:     opt.fillRetryMax,
+		replaceAttempts:  opt.replaceAttempts,
+		replaceInitial:   opt.replaceInitial,
+		replaceMax:       opt.replaceMax,
 	}
 
-	for i := 0; i < cfg.PoolSize; i++ {
-		go p.ensureExit(context.Background(), i)
-	}
+	// A single reconciler owns filling: two enrollments racing on the same
+	// slice could append one exit and overwrite it with the other, leaving
+	// len(exits) short of pool_size while healthy still counted both.
+	go p.fill()
 
-	return p, nil
+	return p
+}
+
+// buildExit enrolls through the injected factory when a test provided one.
+func (p *Pool) buildExit(ctx context.Context) (*Exit, error) {
+	if p.factory != nil {
+		return p.factory(ctx)
+	}
+	return p.createExit(ctx)
 }
 
 func (p *Pool) Acquire(ctx context.Context) (*Exit, error) {
-	// NOTE: no defer-based unlock across the wait path — locking the same
-	// mutex twice (wait path re-locks) self-deadlocks the whole pool.
+	// p.mu is held across the whole scan. The slice header is shared state, so
+	// ranging it unlocked raced with the fill reconciler appending an exit: a
+	// torn header could return the wrong exit, or miss a healthy one, on a live
+	// request. Nothing reached under this lock re-enters p.mu (Exit.Tunnel only
+	// reads a field, and a tunnel's on-dead callback runs after that tunnel
+	// releases its own mutex), so p.mu -> t.mu is the only lock order in play.
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	for _, e := range p.exits {
-		p.mu.Lock()
 		// Exits are SHARED: a MASQUE tunnel is a full netstack host that
 		// carries any number of concurrent TCP flows, so an exit is
 		// available whenever it is healthy, regardless of other streams.
-		if e.Cooldown.IsZero() && e.Tunnel() != nil {
+		if !e.draining && e.Cooldown.IsZero() && e.Tunnel() != nil {
 			e.streams++
 			e.InUseSince = time.Now()
-			p.mu.Unlock()
 			return e, nil
 		}
-		p.mu.Unlock()
 	}
 	return nil, fmt.Errorf("no WARP exit available (all cooling down or starting)")
 }
@@ -93,41 +161,105 @@ func (p *Pool) Fail(exit *Exit, reason string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !exit.Cooldown.IsZero() {
+		// Already failed (onDead plus a dial error on the same exit): its
+		// replacement is running and the counters are already accounted for.
+		return
+	}
 	exit.streams = 0
 	exit.Cooldown = time.Now().Add(cooldownDuration)
-	p.healthy--
-	p.coolingDown++
+	p.recountLocked()
 	log.Printf("WARP exit %s failed: %s (cooldown %v)", exit.ID, reason, cooldownDuration)
 	go p.replaceExit(exit)
 }
 
-func (p *Pool) ensureExit(ctx context.Context, index int) {
-	for attempt := 0; attempt < maxRetries; attempt++ {
+// fill is the single reconciler that keeps pool_size exits enrolled. It never
+// gives up: a transient enrollment failure only delays convergence, so the pool
+// recovers on its own when the network returns instead of staying short until a
+// restart. Contrast replaceExit, which handles an exit that exists but broke.
+func (p *Pool) fill() {
+	delay := p.fillRetryInitial
+	attempt := 0
+	for {
 		select {
-		case <-ctx.Done():
+		case <-p.stopped:
 			return
 		default:
 		}
 
-		exit, err := p.createExit(ctx)
-		if err == nil {
-			p.mu.Lock()
-			if index < len(p.exits) {
-				p.exits[index] = exit
-			} else {
-				p.exits = append(p.exits, exit)
+		p.mu.Lock()
+		full := len(p.exits) >= p.config.PoolSize
+		p.mu.Unlock()
+		if full {
+			// Nothing removes an exit, so reaching pool_size is terminal for the
+			// fill path; keep the loop cheap and re-check in case that changes.
+			attempt = 0
+			delay = p.fillRetryInitial
+			select {
+			case <-p.stopped:
+				return
+			case <-time.After(p.fillRetryMax):
 			}
-			p.healthy++
-			p.mu.Unlock()
-			log.Printf("WARP exit %s ready at %s", exit.ID, exit.IPv6)
-			return
+			continue
 		}
 
-		log.Printf("WARP exit creation failed (attempt %d/%d): %v", attempt+1, maxRetries, err)
-		time.Sleep(retryDelay)
-	}
+		exit, err := p.buildExit(context.Background())
+		if err == nil {
+			p.addExit(exit)
+			attempt = 0
+			delay = p.fillRetryInitial
+			continue
+		}
 
-	log.Printf("WARP exit creation failed after %d attempts", maxRetries)
+		attempt++
+		// Always retry; only the logging thins out so a long outage does not
+		// flood the log for as long as it lasts.
+		if attempt <= fillLogFirst || attempt%fillLogEvery == 0 {
+			log.Printf("WARP exit fill failed (attempt %d, next retry in %v): %v", attempt, delay, err)
+		}
+
+		select {
+		case <-p.stopped:
+			return
+		case <-time.After(delay):
+		}
+		delay *= 2
+		if delay > p.fillRetryMax {
+			delay = p.fillRetryMax
+		}
+	}
+}
+
+// addExit appends one enrolled exit, refusing to exceed pool_size so a surplus
+// enrollment is closed instead of leaked. It also refuses once the pool is
+// closed: an enrollment that finishes after Close must be torn down here, or its
+// tunnel outlives the pool with nobody left to close it.
+func (p *Pool) addExit(exit *Exit) {
+	p.mu.Lock()
+	accept := !p.closedLocked() && len(p.exits) < p.config.PoolSize
+	if accept {
+		p.exits = append(p.exits, exit)
+		p.recountLocked()
+	}
+	p.mu.Unlock()
+
+	if !accept {
+		if exit.Tunnel() != nil {
+			exit.Tunnel().Close()
+		}
+		return
+	}
+	log.Printf("WARP exit %s ready at %s", exit.ID, exit.IPv6)
+}
+
+// closedLocked reports whether Close has already run. Call it with p.mu held.
+func (p *Pool) closedLocked() bool {
+	select {
+	case <-p.stopped:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Pool) replaceExit(failed *Exit) {
@@ -146,8 +278,8 @@ func (p *Pool) replaceExit(failed *Exit) {
 		p.mu.Unlock()
 	}()
 
-	delay := replaceRetryInitial
-	for attempt := 1; attempt <= replaceRetryAttempts; attempt++ {
+	delay := p.replaceInitial
+	for attempt := 1; attempt <= p.replaceAttempts; attempt++ {
 		select {
 		case <-p.stopped:
 			log.Printf("WARP pool closed: replacement for %s aborted", failed.ID)
@@ -156,18 +288,19 @@ func (p *Pool) replaceExit(failed *Exit) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), registrationTimeout)
-		exit, err := p.createExit(ctx)
+		exit, err := p.buildExit(ctx)
 		cancel()
 		if err == nil {
 			p.finishReplacement(failed, exit)
 			return
 		}
 
-		if attempt == replaceRetryAttempts {
-			log.Printf("WARP pool replacement permanently failed for %s after %d attempts: %v (exit stays in cooldown; manual recovery via RecycleAll once network recovers)", failed.ID, attempt, err)
+		if attempt == p.replaceAttempts {
+			log.Printf("WARP pool replacement permanently failed for %s after %d attempts: %v", failed.ID, attempt, err)
+			p.releaseSlot(failed)
 			return
 		}
-		log.Printf("WARP exit replacement failed for %s (attempt %d/%d, next retry in %v): %v", failed.ID, attempt, replaceRetryAttempts, delay, err)
+		log.Printf("WARP exit replacement failed for %s (attempt %d/%d, next retry in %v): %v", failed.ID, attempt, p.replaceAttempts, delay, err)
 
 		select {
 		case <-p.stopped:
@@ -176,10 +309,31 @@ func (p *Pool) replaceExit(failed *Exit) {
 		case <-time.After(delay):
 		}
 		delay *= 2
-		if delay > replaceRetryMaxDelay {
-			delay = replaceRetryMaxDelay
+		if delay > p.replaceMax {
+			delay = p.replaceMax
 		}
 	}
+}
+
+// releaseSlot drops an exit that could not be replaced, so the fill reconciler
+// owns the seat again. Keeping a permanently cooling exit in the slice would let
+// it occupy one of the pool_size seats forever while the fill path, seeing a full
+// pool, never enrolls a working exit in its place.
+func (p *Pool) releaseSlot(exit *Exit) {
+	p.mu.Lock()
+	for i, e := range p.exits {
+		if e == exit {
+			p.exits = append(p.exits[:i], p.exits[i+1:]...)
+			break
+		}
+	}
+	p.recountLocked()
+	p.mu.Unlock()
+
+	if exit.Tunnel() != nil {
+		exit.Tunnel().Close()
+	}
+	log.Printf("WARP exit %s released: the fill reconciler owns this slot again", exit.ID)
 }
 
 func (p *Pool) finishReplacement(failed, exit *Exit) {
@@ -196,19 +350,144 @@ func (p *Pool) finishReplacement(failed, exit *Exit) {
 			break
 		}
 	}
-	// Recalculate counters from actual state
-	healthy := 0
-	cooling := 0
+	// Recalculate counters from actual state (single source of truth).
+	p.recountLocked()
+	log.Printf("WARP exit replaced: %s -> %s (healthy=%d cooling=%d)", failed.ID, exit.ID, p.healthy, p.coolingDown)
+}
+
+// recountLocked derives both counters from the exits themselves. Every other
+// place used to adjust them by hand, so a double fail or a lost append could
+// leave /health reporting a pool that does not exist. Call it with p.mu held.
+func (p *Pool) recountLocked() {
+	healthy, cooling := 0, 0
 	for _, e := range p.exits {
-		if e.Cooldown.IsZero() && e.Tunnel() != nil {
-			healthy++
-		} else if !e.Cooldown.IsZero() {
+		switch {
+		case !e.Cooldown.IsZero():
 			cooling++
+		case e.draining:
+			// Draining: still finishing live streams, unavailable for new work, so
+			// it must not be counted as healthy.
+		case e.Tunnel() != nil:
+			healthy++
 		}
 	}
 	p.healthy = healthy
 	p.coolingDown = cooling
-	log.Printf("WARP exit replaced: %s -> %s (healthy=%d cooling=%d)", failed.ID, exit.ID, healthy, cooling)
+}
+
+
+// usableLocked reports whether an exit may serve a new request. p.mu held.
+func (p *Pool) usableLocked(e *Exit) bool {
+	return e != nil && !e.draining && e.Cooldown.IsZero() && e.Tunnel() != nil
+}
+
+// hasStandbyLocked reports whether some exit other than target stays usable, so a
+// swap can never degrade the last one. p.mu held.
+func (p *Pool) hasStandbyLocked(target *Exit) bool {
+	for _, e := range p.exits {
+		if e != target && p.usableLocked(e) {
+			return true
+		}
+	}
+	return false
+}
+
+// Swap rotates exactly one exit: it stops handing that exit to new requests, lets
+// its live streams finish (best effort, bounded by drainTimeout) and re-enrolls
+// only that exit. The other exits keep serving untouched, which is what
+// RecycleAll cannot do: recycle replaces every exit and cuts the streams in
+// flight, and it burns one enrollment per exit instead of one total.
+//
+// Empty targetID picks the exit carrying the most streams, because that is the
+// egress most likely to be the one being rate-limited. Async and idempotent: a
+// request that arrives while a swap is in flight reports that state and starts
+// nothing. Returns a reason of "unknown_exit" or "no_standby" when nothing ran.
+func (p *Pool) Swap(targetID string) (started bool, status map[string]any, reason string) {
+	p.mu.Lock()
+	if p.recycling || p.swapping {
+		s := p.statusLocked()
+		p.mu.Unlock()
+		return false, s, ""
+	}
+
+	var target *Exit
+	if targetID == "" {
+		for _, e := range p.exits {
+			if !p.usableLocked(e) {
+				continue
+			}
+			if target == nil || e.streams > target.streams {
+				target = e
+			}
+		}
+	} else {
+		for _, e := range p.exits {
+			if e.ID == targetID {
+				target = e
+				break
+			}
+		}
+		if target == nil {
+			s := p.statusLocked()
+			p.mu.Unlock()
+			return false, s, "unknown_exit"
+		}
+	}
+
+	if !p.usableLocked(target) || !p.hasStandbyLocked(target) {
+		s := p.statusLocked()
+		p.mu.Unlock()
+		return false, s, "no_standby"
+	}
+
+	target.draining = true
+	p.swapping = true
+	p.recountLocked()
+	s := p.statusLocked()
+	p.mu.Unlock()
+
+	log.Printf("WARP swap requested for %s: draining before re-enrolling that exit only", target.ID)
+	go p.completeSwap(target)
+	return true, s, ""
+}
+
+func (p *Pool) completeSwap(target *Exit) {
+	defer func() {
+		p.mu.Lock()
+		p.swapping = false
+		p.mu.Unlock()
+	}()
+
+	if !p.waitDrained(target) {
+		log.Printf("WARP pool closed: swap for %s aborted", target.ID)
+		return
+	}
+	log.Printf("WARP swap for %s: drained, re-enrolling that exit only", target.ID)
+	p.replaceExit(target)
+}
+
+// waitDrained blocks until target has no live streams, the drain deadline passes
+// (a stream that never ends must not pin the slot forever), or the pool closes.
+// It reports false only when the pool is closing.
+func (p *Pool) waitDrained(target *Exit) bool {
+	deadline := time.Now().Add(drainTimeout)
+	for {
+		p.mu.Lock()
+		streams := target.streams
+		p.mu.Unlock()
+		switch {
+		case streams == 0:
+			return true
+		case time.Now().After(deadline):
+			log.Printf("WARP swap for %s: drain timed out with %d stream(s) still open; closing anyway", target.ID, streams)
+			return true
+		}
+		select {
+		case <-p.stopped:
+			return false
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 func (p *Pool) createExit(ctx context.Context) (*Exit, error) {
@@ -251,7 +530,7 @@ func (p *Pool) createExit(ctx context.Context) (*Exit, error) {
 // snapshot either way; Status carries "recycling" for the caller.
 func (p *Pool) RecycleAll() (started bool, status map[string]any) {
 	p.mu.Lock()
-	if p.recycling {
+	if p.recycling || p.swapping {
 		s := p.statusLocked()
 		p.mu.Unlock()
 		return false, s
@@ -303,14 +582,17 @@ func (p *Pool) statusLocked() map[string]any {
 	for i, e := range p.exits {
 		status := "healthy"
 		streams := e.streams
-		if streams > 0 {
-			status = "in_use"
-		} else if !e.Cooldown.IsZero() {
+		switch {
+		case !e.Cooldown.IsZero():
 			status = "cooldown"
-		} else if e.Tunnel() == nil {
+		case e.draining:
+			status = "draining"
+		case e.Tunnel() == nil:
 			status = "starting"
+		case streams > 0:
+			status = "in_use"
 		}
-		exits[i] = fmt.Sprintf("%s (%s, streams=%d)", e.ID[:8], status, streams)
+		exits[i] = fmt.Sprintf("%s (%s, streams=%d)", e.ID, status, streams)
 	}
 
 	return map[string]any{
@@ -333,5 +615,5 @@ func (p *Pool) Close() {
 		}
 	}
 	p.exits = nil
-	p.healthy = 0
+	p.recountLocked()
 }

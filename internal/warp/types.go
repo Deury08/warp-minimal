@@ -14,7 +14,11 @@ type Exit struct {
 	CreatedAt  time.Time
 	Cooldown   time.Time
 	InUse      bool
-	streams    int // active conns THROUGH the exit (shared; info only)
+	streams    int // active conns THROUGH the exit; also the swap drain signal
+	// draining marks an exit that must take no new work because a per-exit swap
+	// is in flight: its live streams keep running, then it is re-enrolled.
+	// Guarded by Pool.mu.
+	draining bool
 	InUseSince time.Time
 	tunnel     *Tunnel
 }
