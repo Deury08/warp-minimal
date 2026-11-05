@@ -84,7 +84,16 @@ The userspace WireGuard stack (UDP 2408, 25s keepalive) remains available as
    one-shot `Tunnel.SetOnDead` hook → `Pool.Fail` → auto replacement with a
    fresh registration (intentional `Close()` never triggers it). A failing
    registration retries with backoff instead of abandoning the pool; `POST
-   /recycle` forces an idempotent pool-wide recycle.
+   /recycle` forces an idempotent pool-wide recycle, and `POST /swap` rotates
+   exactly one exit. `CONNECT` replies carry `X-Warp-Exit: <full id>` so a caller
+   can tell which exit served a request and swap just that one.
+8. **Per-exit swap** — `POST /swap` (body optional: `{"exit":"warp-<full id>"}`)
+   marks one exit as `draining`: it stops being handed to new requests, its live
+   streams finish (best effort, 120s cap), and only that exit is re-enrolled. The
+   others keep serving, so unlike `/recycle` no in-flight stream is cut and only
+   one enrollment is burned. Answers `202` (a swap is in flight), `409
+   {"ok":false,"reason":"no_standby"}` when degrading the target would leave no
+   usable exit, `404 {"ok":false,"reason":"unknown_exit"}`, `405` for non-POST.
 
 ---
 
@@ -200,13 +209,22 @@ curl http://127.0.0.1:8789/health
 {
   "ok": true,
   "service": "warp-minimal",
+  "stack": "masque",
   "pool_size": 2,
   "active": 2,
   "healthy": 2,
   "cooling_down": 0,
-  "ex": ["warp-a1b2c3d4 (healthy)", "warp-e5f6g7h8 (healthy)"]
+  "recycling": false,
+  "exits": [
+    "warp-18e5118a93b5c804 (healthy, streams=0)",
+    "warp-18e5118b232db280 (healthy, streams=0)"
+  ]
 }
 ```
+
+> Exit ids are full-length: two enrollments made seconds apart share their
+> leading hex digits, so a truncated prefix cannot tell a rotation from no
+> change. Compare the whole id when you need to confirm a fresh egress.
 
 ---
 
@@ -318,6 +336,19 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 ---
 
 ## Changelog
+
+### Unreleased
+- **`POST /swap` rotates one exit instead of the whole pool**: the target exit is marked `draining` (no new requests), its live streams finish up to a 120s cap, and only that exit is re-enrolled. `/recycle` still replaces every exit and cuts streams in flight; a swap burns one enrollment instead of one per exit. `409 no_standby` when the swap would leave no usable exit, `404 unknown_exit` for an id the pool does not have
+- **`CONNECT` replies carry `X-Warp-Exit: <full exit id>`**: for HTTPS the proxy only tunnels ciphertext and can never read the upstream status, so the reply is the only place it can attribute a request to an exit. A caller that sees a rate limit can now rotate the exit that caused it
+- **`/health` reports a `draining` exit** and stops counting it as healthy, since it is not available for new work
+- **Pool bootstrap no longer gives up**: enrollment is owned by a single reconciler that retries forever with exponential backoff (10s → 60s cap, logging thinned after 5 attempts), driven by `pool_size`. Previously each slot retried 3 times and then stopped for the life of the process, which is how a `pool_size: 2` pool ended up serving on one exit until a restart
+- **One goroutine fills the pool**, which also removes the positional append/overwrite race: two concurrent slots could append one exit and overwrite it with the other, leaving `active: 1` while `healthy` still reported 2
+- **Pool counters are derived, never hand-adjusted**: `healthy` and `cooling_down` are recomputed from the exits themselves (`recountLocked`) and `Fail` is idempotent, so a double fail can no longer report a negative `healthy`
+- **`/health` exit labels carry the full exit id**: the previous 8-character truncation made two enrollments created nanoseconds apart read `warp-18e` twice, so a rotation was indistinguishable from no change
+- `internal/warp/pool_test.go` adds the first pool tests (fill, retry after transient enrollment failure, counter truthfulness, id distinctness) through an injectable `exitFactory`, so pool behavior is pinned without WARP enrollment or a listening port
+- **`Acquire` no longer reads the pool slice unlocked**: the header was shared with the goroutine appending an exit, so a live request could see a torn slice (detected by `-race`); the scan now holds the pool mutex, and `p.mu` → `t.mu` is the only lock order in play
+- **An enrollment that finishes after `Close()` is torn down** instead of being appended to a closed pool with nobody left to close its tunnel
+- **A permanently unreplaceable exit releases its seat**: after the bounded replacement retries are exhausted the exit is dropped and its tunnel closed, so the fill reconciler owns that slot again — previously a dead exit stayed in cooldown, occupied one of the `pool_size` seats, and the pool served degraded until a manual `POST /recycle`
 
 ### v0.2.3 (2026-11-03)
 - **Config is now optional and the defaults are the working configuration**: `stack` defaults to MASQUE (`ipv6`), so a binary with no `config.json` starts on QUIC/UDP 443 instead of the WireGuard stack that silent-fails on networks blocking UDP 2408 (`acquire failed ... 10s` while `/health` still answered `ok`)
