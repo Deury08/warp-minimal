@@ -190,7 +190,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, fail
 	_ = clientConn.SetReadDeadline(time.Time{})
 	_ = clientConn.SetWriteDeadline(time.Time{})
 
-	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+	// Attribution for the client: el proxy no puede ver el status del upstream
+	// (vive dentro del TLS que él mismo reenvía), así que la única señal honesta
+	// de qué salida dialeó este túnel es un header en la propia respuesta CONNECT.
+	connectReply := fmt.Sprintf("HTTP/1.1 200 Connection Established\r\nX-Warp-Exit: %s\r\n\r\n", egressExitID(exit))
+	if _, err := clientConn.Write([]byte(connectReply)); err != nil {
 		clientConn.Close()
 		conn.Close()
 		failExit(failer, exit, err.Error())

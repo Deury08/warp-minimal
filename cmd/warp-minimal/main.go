@@ -141,6 +141,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc(cfg.HealthPath, healthHandler(pool, stackLabel))
 	mux.HandleFunc("/recycle", recycleHandler(pool))
+	mux.HandleFunc("/swap", swapHandler(pool))
 	mux.HandleFunc("/", proxy)
 
 	// Wrap mux so CONNECT requests (not routed by ServeMux) reach the proxy.
@@ -286,6 +287,61 @@ func recycleHandler(pool WGPoolStatuser) http.HandlerFunc {
 		w.WriteHeader(http.StatusAccepted)
 		status["ok"] = started
 		status["recycling"] = true
+		json.NewEncoder(w).Encode(status)
+	}
+}
+
+// swappable es la capacidad opcional de rotar UNA sola salida. Solo *warp.Pool
+// la tiene: el pool WireGuard no la implementa y /swap responde 501 ahí.
+type swappable interface {
+	Swap(targetID string) (started bool, status map[string]any, reason string)
+}
+
+// swapHandler rotates exactly one egress exit. The relay uses it after an
+// upstream 429 to move traffic onto the other exit without cutting the streams
+// in flight — which /recycle cannot avoid — and burning one enrollment instead
+// of one per exit.
+//
+// Async and idempotent: 202 for the call that starts the swap and for any call
+// that arrives while it is in flight. The optional body {"exit":"warp-..."}
+// selects the target; an empty body picks the exit carrying the most streams.
+// 409 means the swap would leave the pool with no usable exit.
+func swapHandler(pool appPool) http.HandlerFunc {
+	sw, ok := pool.(swappable)
+	if !ok {
+		return func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "per-exit swap is not supported by this stack", http.StatusNotImplemented)
+		}
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed; use POST", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Exit string `json:"exit"`
+		}
+		if r.Body != nil {
+			// Empty body is valid: pick the busiest exit.
+			_ = json.NewDecoder(r.Body).Decode(&req)
+		}
+		started, status, reason := sw.Swap(req.Exit)
+		w.Header().Set("Content-Type", "application/json")
+		switch reason {
+		case "unknown_exit":
+			w.WriteHeader(http.StatusNotFound)
+			status["ok"] = false
+			status["error"] = reason
+		case "no_standby":
+			w.WriteHeader(http.StatusConflict)
+			status["ok"] = false
+			status["error"] = reason
+		default:
+			w.WriteHeader(http.StatusAccepted)
+			status["ok"] = started
+			status["swapping"] = true
+		}
+		log.Printf("swap requested: started=%v reason=%q", started, reason)
 		json.NewEncoder(w).Encode(status)
 	}
 }
