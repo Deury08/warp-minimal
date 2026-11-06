@@ -104,3 +104,41 @@ on large payloads, exits kept healthy, prove E2E.
   orphaned warp-test-fixed.exe process on 8793) and the abandoned WG spec
   `odd/tasks/wireguard-egress.md` (history preserved in git); root config.json
   stack corrected wireguard -> masque. Tag v0.2.1 pushed (release workflow).
+- 2026-11-05: pool bootstrap fix — `ensureExit` (3 attempts per slot, then give
+  up for the life of the process) replaced by a single `fill` reconciler that
+  retries forever with exponential backoff 10s -> 60s (log thins to every 10th
+  attempt after the first 5); never gives up, so a transient enroll failure
+  delays convergence instead of leaving the pool short. Owning fill in one
+  goroutine also removed the positional append/overwrite race: two slots could
+  append one exit and overwrite it, leaving active=1 while healthy reported 2.
+  Counters now derived by `recountLocked` from the exits themselves and `Fail`
+  is idempotent (a double fail drove healthy to -1). `/health` exit labels now
+  render the full id — the `ID[:8]` truncation made two enrollments created
+  nanoseconds apart read `warp-18e` twice, so a rotation looked like no change.
+  Tests: new `internal/warp/pool_test.go` (4 tests) via an injectable
+  `exitFactory`/`newPoolWith` seam — RED observed first (active=1/healthy=2,
+  active=0 after transient failures, healthy=-1 after a double fail).
+  `go vet ./...`, `go test ./...`, `go test -race -count=5` clean. Live probe on
+  port 8891 with a temp config: active=2 healthy=2 with distinct full ids,
+  traffic OK, `POST /recycle` -> 2 fresh exits, healthy=2, traffic OK.
+- 2026-11-05 (cont.): independent verification (gentle-ai-verify) returned
+  pass-with-notes and found three real items, all fixed with RED-then-GREEN
+  tests: (A1) `Acquire` ranged `p.exits` unlocked while fill appended to it —
+  a genuine data race on the slice header, reproduced by `-race`
+  (`TestAcquireJoinsFillWithoutRace`); the scan now holds `p.mu`, and
+  `p.mu -> t.mu` is the only order (markDead releases `t.mu` before its
+  callback). (A2) an enrollment finishing after `Close()` was appended to a
+  closed pool and leaked its tunnel (`TestPoolCloseDuringFillEnrollmentLeaksNothing`):
+  `addExit` now refuses once stopped and closes the tunnel. (A3) a permanently
+  unreplaceable exit stayed in cooldown occupying a `pool_size` seat, so fill
+  could never repair the hole — the bounded replacement retries now end by
+  releasing the slot to fill (`TestPermanentReplacementFailureReleasesSlot`),
+  with `replaceAttempts`/`replaceInitial`/`replaceMax` as test seams. N1: the
+  double-fail test raced its own expectation against the instant fake factory
+  (a note from the verifier), rewritten with the replacement held in flight and
+  now also pinning that the second fail does not extend the cooldown.
+  Live probe on port 8892 produced the real failure mode during enrollment
+  (`register device: status 429: error code: 1015` at fill attempt 3) and the
+  reconciler enrolled both exits 45s later — active=2 healthy=2; 10 concurrent
+  requests OK, `POST /recycle` -> 2 fresh exits, traffic OK, warp=on.
+  Final: `go vet ./...` clean, `go test -race ./... -count=3` green.

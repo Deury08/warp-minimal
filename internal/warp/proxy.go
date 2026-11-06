@@ -138,6 +138,11 @@ func ProxyHandlerEgress(pool EgressPool) http.HandlerFunc {
 }
 
 // handleConnect establece un túnel TCP a través de un exit WARP para tráfico HTTPS.
+// servedNoter is the optional ability to count the tunnels an exit carried, so
+// /health can expose a monotonic per-exit counter (used by clients whose HTTP
+// stack hides the CONNECT reply and cannot read X-Warp-Exit).
+type servedNoter interface{ noteServed() }
+
 func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, failer failable) {
 	ctx := r.Context()
 
@@ -165,6 +170,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, fail
 		return
 	}
 
+	// Attribution for clients that cannot read this reply (Bun's fetch builds the
+	// CONNECT itself and hides it): count the tunnel on the exit that dialed, so
+	// /health can be diffed around one attempt.
+	if noter, ok := exit.(servedNoter); ok {
+		noter.noteServed()
+	}
+
 	// Señal de establecimiento exitoso del túnel.
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -190,7 +202,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, fail
 	_ = clientConn.SetReadDeadline(time.Time{})
 	_ = clientConn.SetWriteDeadline(time.Time{})
 
-	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+	// Attribution for the client: el proxy no puede ver el status del upstream
+	// (vive dentro del TLS que él mismo reenvía), así que la única señal honesta
+	// de qué salida dialeó este túnel es un header en la propia respuesta CONNECT.
+	connectReply := fmt.Sprintf("HTTP/1.1 200 Connection Established\r\nX-Warp-Exit: %s\r\n\r\n", egressExitID(exit))
+	if _, err := clientConn.Write([]byte(connectReply)); err != nil {
 		clientConn.Close()
 		conn.Close()
 		failExit(failer, exit, err.Error())
