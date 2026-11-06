@@ -216,15 +216,28 @@ curl http://127.0.0.1:8789/health
   "cooling_down": 0,
   "recycling": false,
   "exits": [
-    "warp-18e5118a93b5c804 (healthy, streams=0)",
-    "warp-18e5118b232db280 (healthy, streams=0)"
+    "warp-18e5118a93b5c804 (in_use, served=7, streams=2)",
+    "warp-18e5118b232db280 (healthy, served=0, streams=0)"
   ]
 }
 ```
 
+Each entry has a fixed shape, `<full id> (<state>, served=N, streams=N)`, with
+no optional fields. The states are `starting`, `healthy`, `in_use`, `draining`,
+`cooldown`; `draining` outranks `cooldown`, so an exit being swapped stays
+visible even if its tunnel dies mid-swap.
+
 > Exit ids are full-length: two enrollments made seconds apart share their
 > leading hex digits, so a truncated prefix cannot tell a rotation from no
 > change. Compare the whole id when you need to confirm a fresh egress.
+
+`served` counts **tunnels**, not requests: a client reuses one `CONNECT` for
+many requests, so three fetches over the same connection increment it once. It
+exists for callers whose runtime hides the `CONNECT` reply and cannot read
+`X-Warp-Exit`; they attribute a failure by taking a snapshot before and after
+the request and looking at which exit moved. One increment is not proof by
+itself — an unrelated concurrent tunnel moves the same counter — so trust the
+diff only for an exit whose state and tunnel are still valid.
 
 ---
 
