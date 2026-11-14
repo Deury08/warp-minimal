@@ -30,7 +30,7 @@ func withBuildIdentity(t *testing.T, version, commit, at string) {
 // like a broken field; "unknown" reads like "nobody injected this" — and that
 // distinction is the whole reason S1 exists.
 func TestBuildIdentityDefaultsAreUnknownNotEmpty(t *testing.T) {
-	wantVersion, wantCommit, wantAt := "v0.2.3", "unknown", "unknown"
+	wantVersion, wantCommit, wantAt := "v0.4.0", "unknown", "unknown"
 	if got := shippedBuildIdentity; got != [3]string{wantVersion, wantCommit, wantAt} {
 		t.Fatalf("shipped build identity = %v, want [%s %s %s]", got, wantVersion, wantCommit, wantAt)
 	}

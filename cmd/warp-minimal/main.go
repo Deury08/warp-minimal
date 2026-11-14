@@ -34,7 +34,7 @@ type Config struct {
 //
 // It is a VARIABLE on purpose: `-ldflags -X` only rewrites package-level
 // variables, so a const here would make every injection a silent no-op.
-var buildVersion = "v0.2.3"
+var buildVersion = "v0.4.0"
 
 // buildCommit and buildAt are the build stamp the relay asked for (S1), also
 // injected with -ldflags -X and also variables for the same reason. The default

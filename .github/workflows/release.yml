@@ -53,7 +53,9 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           out="warp-minimal${{ matrix.ext }}"
-          go build -ldflags="-s -w" -o "$out" ./cmd/warp-minimal
+          go build -trimpath \
+            -ldflags="-s -w -X main.buildCommit=${GITHUB_SHA::7} -X main.buildAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o "$out" ./cmd/warp-minimal
           if [ "${{ matrix.goos }}" = "windows" ]; then
             zip "${{ matrix.artifact }}_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" "$out"
           else
