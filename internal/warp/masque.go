@@ -32,7 +32,11 @@ import (
 )
 
 // MASQUE constants mirror the official Cloudflare WARP client.
-var masqueEndpointAddr = "162.159.198.1:443"
+// defaultMasqueEndpoint is the Cloudflare MASQUE peer used until an enrollment
+// reports one. Immutable on purpose: NewMasqueTunnel resolves its endpoint per
+// call, so two concurrent enrollments can no longer clobber shared state and
+// dial each other's endpoint.
+const defaultMasqueEndpoint = "162.159.198.1:443"
 
 const (
 	masqueSNI        = "consumer-masque.cloudflareclient.com"
@@ -85,14 +89,16 @@ func NewMasqueTunnel(ctx context.Context, cfg WireGuardConfig, endpoint string) 
 	}
 	cfg.ClientIPv4, cfg.ClientIPv6 = v4, v6
 	// Prefer IPv4: the endpoint's /103::6 may be unreachable from WISP v6.
+	// Resolved into a local: the value belongs to THIS enrollment only.
+	enrolled := defaultMasqueEndpoint
 	if epV4 != "" {
-		masqueEndpointAddr = epV4 + ":443"
+		enrolled = epV4 + ":443"
 	} else if epV6 != "" {
-		masqueEndpointAddr = "[" + epV6 + "]:443"
+		enrolled = "[" + epV6 + "]:443"
 	}
 
 	// 3. QUIC dial with client-cert TLS auth.
-	ep := masqueEndpointAddr
+	ep := enrolled
 	if endpoint != "" {
 		ep = endpoint
 	}
