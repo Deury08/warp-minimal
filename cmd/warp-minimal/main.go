@@ -297,9 +297,15 @@ func healthHandler(pool WGPoolStatuser, stackLabel string) http.HandlerFunc {
 
 // recycleHandler re-enrolls the pool so every exit gets a fresh WARP egress
 // IP (the bridge calls this after persistent upstream 429s via warp).
-// Always async and idempotent: POST returns 202 with recycling=true both for
-// the call that starts the cycle and for any call that arrives while the
-// cycle is running, so repeated callers never duplicate enrollment work.
+// Always async and idempotent: POST answers 202 both for the call that starts
+// the cycle and for any call that arrives while one is running, so repeated
+// callers never duplicate enrollment work.
+//
+// `recycling` is NOT written here. It already rides in the pool snapshot, taken
+// from p.recycling under Pool.mu, so the field is evidence instead of decoration:
+// true only while a cycle really is in flight. `started` is the companion fact —
+// true only for the call that started it — so a caller can tell "I started it"
+// from "one was already running" without inferring it from a constant.
 func recycleHandler(pool WGPoolStatuser) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -310,8 +316,15 @@ func recycleHandler(pool WGPoolStatuser) http.HandlerFunc {
 		log.Printf("recycle requested: started=%v", started)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
+		if _, ok := status["recycling"]; !ok {
+			// Pools with no real recycling flag (the WireGuard snapshot) still owe
+			// this field: the relay reads it, and an absent key is neither true nor
+			// false. started is the closest truth available and never invents a
+			// rotation that did not begin.
+			status["recycling"] = started
+		}
 		status["ok"] = started
-		status["recycling"] = true
+		status["started"] = started
 		json.NewEncoder(w).Encode(status)
 	}
 }
