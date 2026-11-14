@@ -254,6 +254,16 @@ func healthHandler(pool WGPoolStatuser, stackLabel string) http.HandlerFunc {
 		// Se reporta el tipo que construyó main para que el diagnóstico
 		// refleje la realidad.
 		status["stack"] = stackLabel
+		// Capacidad declarada, nunca descubierta. El plano de control no puede
+		// sondear /exits: contra un build sin la ruta el sondeo cae en el proxy,
+		// el pool culpa a una exit y esa exit queda 30m en cooldown. Por eso se
+		// anuncia acá, donde leerla es gratis.
+		//
+		// AUSENTE cuando no hay soporte, jamás `false` explícito: la ausencia es
+		// lo que impide que un binario viejo mienta sobre sus capacidades.
+		if _, ok := pool.(exitFacts); ok {
+			status["capabilities"] = map[string]bool{"exits": true}
+		}
 		json.NewEncoder(w).Encode(status)
 	}
 }
