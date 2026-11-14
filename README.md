@@ -49,7 +49,9 @@ The userspace WireGuard stack (UDP 2408, 25s keepalive) remains available as
 | **Self-healing pool** | Dead tunnels fail their exit and are auto-replaced; failed registrations retry with exponential backoff (10s → 60s, 20 attempts) instead of leaving the pool empty |
 | **Userspace** | No root, no TUN, no `NET_ADMIN` — quic-go + gVisor netstack |
 | **TLS fingerprint** | uTLS with Bun ClientHello (JA4 `t13d1713h1`) to pass fingerprint gates |
-| **Health endpoint** | `GET /health` → JSON pool status |
+| **Health endpoint** | `GET /health` → JSON pool status plus `build: {commit, built_at}` and `capabilities.exits` |
+| **Exit facts API** | `GET /exits` and `GET /exit/<id>` → one JSON object per exit: state, `served`, live streams, timestamps, the egress IP Cloudflare actually sees, and the last trace result |
+| **Exit preference** | `Proxy-Authorization: Basic base64("<exit-id>:")` pins a request to one exit; an unknown or unusable id falls back to normal acquisition instead of answering `407` |
 | **License** | **MIT** (wireguard-go is MIT-like and compatible; only the WireGuard kernel module is GPLv2 and is NOT used) |
 
 ---
@@ -171,7 +173,7 @@ The file is an **override**, not a requirement:
 ```bash
 ./warp-minimal -print-config        # effective config as JSON (defaults, or defaults + file)
 ./warp-minimal -config my.json      # override from a file
-./warp-minimal -version
+./warp-minimal -version             # warp-minimal v0.4.0 (<short commit>)
 ```
 
 Copy [`config.example.json`](config.example.json) as a starting point. The startup
@@ -197,6 +199,30 @@ requests.get("https://api.example.com", proxies={"https": "http://127.0.0.1:8789
 fetch("https://api.example.com", { dispatcher: new ProxyAgent("http://127.0.0.1:8789") })
 ```
 
+### Pinning a request to one exit
+
+The proxy credential selects the exit: the exit id travels as the **Basic
+username**, and the password is **ignored** — there is no authentication here.
+
+```bash
+# Proxy-Authorization: Basic base64("warp-18e5118a93b5c804:")
+curl -x http://127.0.0.1:8789 -U 'warp-18e5118a93b5c804:' https://httpbin.org/ip
+```
+
+- It has to be a **proxy** header, not a normal request header: on `CONNECT` the
+  proxy only sees the tunnel request, and the real request's headers travel
+  encrypted inside the TLS it blindly forwards, so a custom header from your app
+  never reaches it.
+- The exact form is `Proxy-Authorization: Basic base64("<exit-id>:")` — id,
+  colon, nothing after it. `-U '<id>:'` in cURL produces exactly that.
+- It works for plain-HTTP forwarding as well as `CONNECT`, and the header is
+  hop-by-hop, so it is stripped before the request reaches the target.
+- **There is no `407` fallback.** An unknown id, an id that is `draining` or in
+  `cooldown`, or a stack without preference support is served by normal pool
+  acquisition — silently, never with `407 Proxy Authentication Required`. Treat
+  it as a preference, not a guarantee, and read `X-Warp-Exit` on the `CONNECT`
+  reply (or `served` on `/exits`) to learn which exit actually served you.
+
 ---
 
 ## Health Check
@@ -215,6 +241,8 @@ curl http://127.0.0.1:8789/health
   "healthy": 2,
   "cooling_down": 0,
   "recycling": false,
+  "build": { "commit": "9a09039", "built_at": "2026-11-14T02:35:54Z" },
+  "capabilities": { "exits": true },
   "exits": [
     "warp-18e5118a93b5c804 (in_use, served=7, streams=2)",
     "warp-18e5118b232db280 (healthy, served=0, streams=0)"
@@ -238,6 +266,200 @@ exists for callers whose runtime hides the `CONNECT` reply and cannot read
 the request and looking at which exit moved. One increment is not proof by
 itself — an unrelated concurrent tunnel moves the same counter — so trust the
 diff only for an exit whose state and tunnel are still valid.
+
+### `capabilities.exits` — declared, never discovered
+
+`/health` advertises the optional surfaces this binary can serve:
+
+```json
+"capabilities": { "exits": true }
+```
+
+The key is **absent**, not `false`, when the running build cannot serve
+`/exits` (the userspace WireGuard pool does not implement per-exit facts). The
+absence is the point: a build that only knew the old surface cannot lie about
+what it supports.
+
+Detect it with one read, never by probing the endpoint:
+
+```bash
+curl -s http://127.0.0.1:8789/health | jq -e '.capabilities.exits == true'
+```
+
+> **Do not probe `/exits` to find out.** A request for a route this binary does
+> not have falls into the proxy catch-all, the pool blames whichever exit
+> carried it, and that exit sits out a 30-minute cooldown. `/health` answers the
+> same question for free.
+
+### `build` — which binary is answering
+
+```json
+"build": { "commit": "9a09039", "built_at": "2026-11-14T02:35:54Z" }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `commit` | Short git SHA the binary was built from |
+| `built_at` | Build timestamp, RFC3339 UTC |
+
+Both are injected at link time with `-ldflags -X` (`main.buildCommit`,
+`main.buildAt`) and both default to the literal **`unknown`** — never `""` —
+when the binary was not stamped, so a self-built or locally-`go run` binary is
+readable as "nobody injected this" instead of looking broken. `-version` prints
+the tag together with the same commit.
+
+Exact reproducible build command (this is what the release workflow runs):
+
+```bash
+go build -trimpath \
+  -ldflags="-s -w -X main.buildCommit=$(git rev-parse --short HEAD) -X main.buildAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -o warp-minimal ./cmd/warp-minimal
+```
+
+---
+
+## Exit facts API
+
+`GET /exits` returns a JSON array of exit facts; `GET /exit/<id>` returns the
+same object for a single exit (`404` if the pool has no such id). Both are
+read-only with respect to the pool: asking for facts never enrols, rotates or
+promotes an exit.
+
+```bash
+curl http://127.0.0.1:8789/exits
+curl http://127.0.0.1:8789/exit/warp-18e5118a93b5c804
+```
+
+```json
+[
+  {
+    "id": "warp-18e5118a93b5c804",
+    "state": "in_use",
+    "served": 7,
+    "streams": 1,
+    "created_at": 1786001204,
+    "cooldown_until": 0,
+    "in_use_since": 1786004812,
+    "ip": "2a09:bac5:c4d2:1f3a::7b2",
+    "family": "v6",
+    "observed_at": 1786004901,
+    "trace": { "ok": true, "at": 1786004901 }
+  },
+  {
+    "id": "warp-18e5118b232db280",
+    "state": "healthy",
+    "served": 0,
+    "streams": 0,
+    "created_at": 1786001210,
+    "cooldown_until": 0,
+    "in_use_since": 0,
+    "trace": {
+      "ok": false,
+      "error": "trace: request [2606:4700:4700::1111]:443: context deadline exceeded",
+      "at": 1786004880
+    }
+  }
+]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Full exit id, shaped `warp-<hex>` |
+| `state` | Exactly one of `healthy`, `in_use`, `draining`, `cooldown`, `starting` (see below) |
+| `served` | `CONNECT` tunnels this exit established. Monotonic per exit and never reset — a recycle replaces the exits, so a fresh exit starts its own count at `0` |
+| `streams` | TCP flows in flight through this exit right now (exits are shared, so any number can ride one) |
+| `created_at` | When the exit was enrolled, epoch seconds |
+| `cooldown_until` | Epoch seconds when the cooldown lifts; `0` = not cooling down |
+| `in_use_since` | Epoch seconds of the current acquisition; `0` = nothing in flight |
+| `ip` | Egress address Cloudflare sees for this tunnel — **omitted when unknown** |
+| `family` | `v4` or `v6`, derived from `ip` — **omitted when unknown** |
+| `observed_at` | Epoch seconds when that `ip` was observed — **omitted when unknown** |
+| `trace` | Result of the last egress-trace attempt — **absent when never attempted** |
+
+Rules a consumer must code against:
+
+- **Timestamps are epoch SECONDS, and `0` means "not applicable", never 1970.**
+  Compare `cooldown_until` against your own clock; a `0` is "no cooldown", not
+  "cooling since the epoch". The zero convention is what lets you tell "never"
+  from "56 years ago".
+- **`ip`, `family` and `observed_at` are omitted when unknown.** A live exit
+  whose trace failed and which has no cached observation still reports its
+  state, counters and timestamps; the address fields are simply absent. Treat
+  "missing" as "no answer yet", not as an error and not as an empty string.
+- **`healthy` means ELIGIBLE, not reachable.** It says the pool would hand this
+  exit to the next request — tunnel up, not draining, not cooling down. An
+  eligible exit that is already carrying flows reports `in_use` instead; both
+  describe eligibility, neither is a reachability probe: traffic through a
+  `healthy` exit can still fail upstream.
+- `state` is exactly one of `healthy`, `in_use`, `draining`, `cooldown`,
+  `starting`. `draining` outranks `cooldown`, so an exit being swapped stays
+  visible as `draining` even if its tunnel dies mid-swap.
+- **`/exit/<id>` for an unknown id answers `404` with a plain-text body,
+  `404 page not found`.** Read the status code, not the body: a body-shaped
+  check will misread a missing route as success.
+- **A non-`GET` method on `/exits` or `/exit/<id>` answers `405`**
+  (`method not allowed; use GET`).
+- **A stack without this capability answers `404`, not `500`**, for both routes
+  and for every method — check `capabilities.exits` in `/health` rather than
+  interpreting the 404.
+
+### `trace` — why an exit has no IP
+
+`trace` publishes the last egress-trace attempt (`GET https://1.1.1.1/cdn-cgi/trace`
+through the exit's own tunnel, whose `ip=` line is the only honest source of the
+real egress address).
+
+| Field | Meaning |
+|-------|---------|
+| `ok` | `true` when that attempt succeeded |
+| `error` | Failure message of the last attempt — omitted when `ok` is `true` |
+| `at` | Epoch seconds of that attempt |
+
+`ip`, `family`, `observed_at` and `trace` all come from the same per-exit
+observation, refreshed at most once every **45 seconds**: the first facts read
+after the cache goes stale runs one trace through that exit (10s per attempt,
+all exits under a 30s budget), and every read in between is answered from the
+cache without a handshake. A facts poll is therefore cheap, but not free, and
+`trace` always describes the same attempt as `ip`.
+
+- **A failed trace keeps serving the last cached IP alongside the error.** If a
+  previous success is cached, `ip`, `family` and `observed_at` stay populated
+  while `trace.ok` is `false` with the reason — a stale address is actionable, a
+  hole is not. Only when there is no cached observation at all do the address
+  fields disappear.
+- **A successful trace clears the previous error**: `trace.ok` describes the
+  last attempt, not the worst one ever seen.
+- **Absence of `trace` means "never attempted"**, which is different from a
+  failed attempt (`ok: false`) — the second one carries an `at`, the first one
+  carries nothing.
+
+### `POST /recycle`
+
+Re-enrols the whole pool so every exit gets a fresh WARP egress address. Async
+and idempotent: it always answers **`202 Accepted`**, both for the call that
+starts the cycle and for any call that arrives while one is running.
+
+```json
+{
+  "pool_size": 2,
+  "active": 2,
+  "healthy": 2,
+  "cooling_down": 0,
+  "exits": ["warp-18e5118a93b5c804 (healthy, served=7, streams=0)"],
+  "recycling": true,
+  "ok": true,
+  "started": true
+}
+```
+
+- `recycling` is the pool's **real** flag, read from the pool snapshot, so it is
+  `true` only while a cycle genuinely is in flight. It is no longer forced to
+  `true` by the handler. On the WireGuard pool, which has no such flag of its
+  own, it mirrors `started` instead of inventing a rotation that did not begin.
+- `started` is `true` only for the call that actually started the cycle — it is
+  how you tell "I started it" from "one was already running".
+- `ok` **equals** `started`: a `202` with `ok: false` means the cycle was already
+  in progress, not that the request failed.
 
 ---
 
@@ -349,6 +571,16 @@ protocol notes of [`Diniboy1123/usque`](https://github.com/Diniboy1123/usque)
 ---
 
 ## Changelog
+
+### v0.4.0 (2026-11-14)
+- **`GET /exits` and `GET /exit/<id>`: the HTTP surface now publishes per-exit facts as JSON**, not only the `"<id> (<state>, served=N, streams=N)"` strings embedded in `/health`. Each fact carries `state`, `served`, `streams`, `created_at`, `cooldown_until`, `in_use_since`, the observed egress `ip`/`family`/`observed_at`, and the last `trace`. Timestamps are epoch SECONDS where `0` means "not applicable"; `ip`, `family` and `observed_at` are omitted when unknown; `/exit/<id>` answers `404` for an unknown id and `405` for a non-`GET`; a stack without the capability answers `404`, never `500`
+- **`/health` declares `capabilities.exits`**: the capability is advertised where reading it is free, because probing `/exits` on a build that lacks the route falls into the proxy catch-all, the pool blames the exit that carried it, and that exit takes a 30-minute cooldown. The key is absent, not `false`, when unsupported
+- **`/health` publishes the build identity**: `build: {commit, built_at}`, injected with `-ldflags -X main.buildCommit` / `-X main.buildAt` (defaults `unknown`, never `""`), so "runs what was installed" is distinguishable from "runs something from three hours ago in memory". `buildVersion` became a `var` for the same `-X` reason, and the exact reproducible build command is documented
+- **Per-exit `trace: {ok, error, at}`**: the last egress-trace attempt is now published from the 45s cache instead of being dropped, so a control plane can see *why* an exit has no IP. A failed trace keeps serving the last cached IP next to the error; absence of `trace` means "never attempted", and a success clears the previous error
+- **Exit preference via `Proxy-Authorization: Basic base64("<exit-id>:")`**: the id travels as the Basic username and the password is ignored. An unknown, draining or cooling id falls back to normal acquisition silently — the proxy never answers `407`
+- **`POST /recycle` no longer lies about being in flight**: it published `recycling: true` unconditionally, even when nothing had started. It now republishes the pool's real `recycling` flag and adds `started`, with `ok == started`; `202` is unchanged so existing callers keep working
+- **Origin-form requests now dial their `Host` header**: `proxyRequest` read only `r.URL.Host`, which is empty for origin-form (`GET /path` — what browsers, probes and misaimed health checks send), so the address became `:80`, the dial failed and the failure was charged to the exit: 30 minutes of cooldown plus a replacement, which with `pool_size: 1` is a total outage. Origin-form now falls back to `r.Host`, and a request with no authority at all answers `400` without touching the pool. A real dial failure against a well-formed target still marks the exit, so dead-exit detection is not silenced
+- `-version` reports `v0.4.0 (<short commit>)`
 
 ### Unreleased
 - **`POST /swap` rotates one exit instead of the whole pool**: the target exit is marked `draining` (no new requests), its live streams finish up to a 120s cap, and only that exit is re-enrolled. `/recycle` still replaces every exit and cuts streams in flight; a swap burns one enrollment instead of one per exit. `409 no_standby` when the swap would leave no usable exit, `404 unknown_exit` for an id the pool does not have
