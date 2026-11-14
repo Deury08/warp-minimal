@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -138,20 +139,7 @@ func main() {
 
 	proxy := warp.ProxyHandlerEgress(egressPool)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc(cfg.HealthPath, healthHandler(pool, stackLabel))
-	mux.HandleFunc("/recycle", recycleHandler(pool))
-	mux.HandleFunc("/swap", swapHandler(pool))
-	mux.HandleFunc("/", proxy)
-
-	// Wrap mux so CONNECT requests (not routed by ServeMux) reach the proxy.
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodConnect {
-			proxy(w, r)
-			return
-		}
-		mux.ServeHTTP(w, r)
-	})
+	handler := newHandler(*cfg, pool, proxy, stackLabel)
 
 	server := &http.Server{
 		Addr:         cfg.Listen,
@@ -358,4 +346,94 @@ type WGPoolStatuser interface {
 type appPool interface {
 	WGPoolStatuser
 	Close()
+}
+
+// newHandler arma el router del servidor: hechos por exit, health, verbos del
+// pool y el proxy al final. CONNECT no lo rutea ServeMux, así que se desvía
+// antes.
+func newHandler(cfg Config, pool appPool, proxy http.HandlerFunc, stackLabel string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc(cfg.HealthPath, healthHandler(pool, stackLabel))
+	mux.HandleFunc("/recycle", recycleHandler(pool))
+	mux.HandleFunc("/swap", swapHandler(pool))
+	mux.HandleFunc("/exits", exitsHandler(pool))
+	mux.HandleFunc("/exit/", exitHandler(pool))
+	// El proxy queda como catch-all INTACTO. Se evaluó devolver 404 a pedidos en
+	// origin-form para que el plano de control distinguiera "ruta ausente" de
+	// "proxy roto", pero eso cambia el comportamiento del camino que hoy lleva
+	// todo el tráfico real. Un endpoint nuevo (/exits, /exit/<id>) se detecta por
+	// 200 JSON, no por el 404 de una ruta inexistente: no vale arriesgar el proxy
+	// en producción por una comodidad de sondeo.
+	mux.HandleFunc("/", proxy)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			proxy(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// exitFacts es la capacidad opcional de reportar hechos por exit. Sólo el pool
+// MASQUE la expone; el de WireGuard responde 404, que es cómo el plano de
+// control detecta que este binario no soporta el endpoint.
+type exitFacts interface {
+	ExitFacts(ctx context.Context) []warp.ExitFact
+	ExitFact(ctx context.Context, id string) (warp.ExitFact, bool)
+}
+
+// factObserverTimeout acota la observación de IP de todas las exits. Con
+// pool_size 2 y los traces serializados por exit, el peor caso son dos traces.
+const factObserverTimeout = 30 * time.Second
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// exitsHandler publica los hechos de todas las exits: array plano, sólo hechos.
+func exitsHandler(pool appPool) http.HandlerFunc {
+	facts, ok := pool.(exitFacts)
+	if !ok {
+		return func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed; use GET", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), factObserverTimeout)
+		defer cancel()
+		writeJSON(w, http.StatusOK, facts.ExitFacts(ctx))
+	}
+}
+
+// exitHandler publica los hechos de UNA exit. 404 si ese id no existe.
+func exitHandler(pool appPool) http.HandlerFunc {
+	facts, ok := pool.(exitFacts)
+	if !ok {
+		return func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed; use GET", http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/exit/")
+		// Un id con "/" o vacío no es una exit: 404 antes de tocar el pool.
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), factObserverTimeout)
+		defer cancel()
+		fact, found := facts.ExitFact(ctx, id)
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, fact)
+	}
 }
