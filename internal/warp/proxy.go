@@ -182,6 +182,11 @@ func ProxyHandlerEgress(pool EgressPool) http.HandlerFunc {
 		defer pool.Release(exit)
 
 		if err := proxyRequest(ctx, w, r, exit); err != nil {
+			if errors.Is(err, errNoHost) {
+				// No authority to dial: refuse the client, never the exit.
+				http.Error(w, "bad request: no host", http.StatusBadRequest)
+				return
+			}
 			log.Printf("WARP proxy error: %v", err)
 			failExit(failer, exit, err.Error())
 			http.Error(w, fmt.Sprintf("WARP proxy error: %v", err), http.StatusBadGateway)
@@ -318,9 +323,23 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, fail
 // CONNECT viaja en el reply del túnel; en HTTP plano lo agrega el proxy.
 const warpExitHeader = "X-Warp-Exit"
 
+// errNoHost marks a request that carries no authority at all. It is a client
+// mistake, never evidence about an exit, so the handler answers 400 and leaves
+// the pool alone. Without this distinction one ordinary `GET /` used to blame a
+// healthy exit and cost it a 30 minute cooldown.
+var errNoHost = errors.New("request has no host")
+
 // proxyRequest reenvía un único request HTTP a través de un exit WARP.
 func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, exit EgressDialer) error {
 	host := r.URL.Host
+	if host == "" {
+		// Origin-form requests (GET /path) carry no authority in the URL; the
+		// host lives in the Host header. Read it or dial an empty address.
+		host = r.Host
+	}
+	if host == "" {
+		return errNoHost
+	}
 	if !strings.Contains(host, ":") {
 		if r.URL.Scheme == "https" {
 			host = host + ":443"
