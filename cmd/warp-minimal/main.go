@@ -31,7 +31,26 @@ type Config struct {
 // buildVersion identifies the binary. It must move whenever new code could be
 // confused with an existing tag: a stale version string is how a WireGuard-only
 // build once shipped reporting "v0.1.0" while carrying newer code.
-const buildVersion = "v0.2.3"
+//
+// It is a VARIABLE on purpose: `-ldflags -X` only rewrites package-level
+// variables, so a const here would make every injection a silent no-op.
+var buildVersion = "v0.2.3"
+
+// buildCommit and buildAt are the build stamp the relay asked for (S1), also
+// injected with -ldflags -X and also variables for the same reason. The default
+// is the literal "unknown", never "": an empty string reads like a broken
+// field, while "unknown" reads like "nobody injected this".
+var (
+	buildCommit = "unknown" // -X main.buildCommit=$(git rev-parse --short HEAD)
+	buildAt     = "unknown" // -X main.buildAt=$(date -u +%Y-%m-%dT%H:%M:%SZ), RFC3339 UTC
+)
+
+// versionLine es lo que imprime -version: la etiqueta del build más el commit
+// inyectado por el linker, para poder distinguir "corre lo instalado" de "corre
+// algo de hace tres horas" sin pegarle a /health.
+func versionLine() string {
+	return "warp-minimal " + buildVersion + " (" + buildCommit + ")"
+}
 
 // Built-in defaults. They mirror config.example.json exactly (guarded by
 // TestExampleConfigMatchesDefaults) and describe the configuration this proxy
@@ -71,7 +90,7 @@ func main() {
 	flag.Parse()
 
 	if *version {
-		fmt.Println("warp-minimal " + buildVersion)
+		fmt.Println(versionLine())
 		return
 	}
 
@@ -254,6 +273,14 @@ func healthHandler(pool WGPoolStatuser, stackLabel string) http.HandlerFunc {
 		// Se reporta el tipo que construyó main para que el diagnóstico
 		// refleje la realidad.
 		status["stack"] = stackLabel
+		// Identidad del build: sin esto no se puede distinguir "corre lo
+		// instalado" de "corre algo de hace tres horas en memoria". Los valores
+		// vienen del linker (-X main.buildCommit / main.buildAt) y por default
+		// son "unknown", nunca "".
+		status["build"] = map[string]string{
+			"commit":   buildCommit,
+			"built_at": buildAt,
+		}
 		// Capacidad declarada, nunca descubierta. El plano de control no puede
 		// sondear /exits: contra un build sin la ruta el sondeo cae en el proxy,
 		// el pool culpa a una exit y esa exit queda 30m en cooldown. Por eso se
