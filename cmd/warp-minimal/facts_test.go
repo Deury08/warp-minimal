@@ -179,6 +179,65 @@ func TestFactEndpointsAre404OnStacksWithoutFacts(t *testing.T) {
 	}
 }
 
+// TestExitsPublishesTheTraceObject pins S3's wire shape: trace is a nested
+// object with ok/error/at, the error is omitted when ok, and the whole key is
+// omitted when no attempt was ever made.
+func TestExitsPublishesTheTraceObject(t *testing.T) {
+	const failure = "trace: status 403 from [2606:4700:4700::1111]:443"
+	h := factsHandler(t, fakeFactsPool{facts: []warp.ExitFact{
+		{ID: "warp-traced-ok", State: "healthy", Trace: &warp.TraceFact{OK: true, At: 1700000600}},
+		{ID: "warp-traced-fail", State: "healthy", Trace: &warp.TraceFact{OK: false, Error: failure, At: 1700000900}},
+		{ID: "warp-never-traced", State: "healthy"},
+	}})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/exits", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("body is not a JSON array: %v (body=%s)", err, rec.Body.String())
+	}
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3", len(got))
+	}
+
+	okTrace, present := got[0]["trace"].(map[string]any)
+	if !present {
+		t.Fatalf("first exit lost its trace: %s", rec.Body.String())
+	}
+	if okTrace["ok"] != true {
+		t.Fatalf("trace.ok = %v, want true", okTrace["ok"])
+	}
+	if _, hasError := okTrace["error"]; hasError {
+		t.Fatalf("trace.error present on a successful trace: %v", okTrace)
+	}
+	if okTrace["at"] != float64(1700000600) {
+		t.Fatalf("trace.at = %v, want 1700000600 (absolute epoch)", okTrace["at"])
+	}
+
+	failTrace, present := got[1]["trace"].(map[string]any)
+	if !present {
+		t.Fatalf("second exit lost its trace: %s", rec.Body.String())
+	}
+	if failTrace["ok"] != false {
+		t.Fatalf("trace.ok = %v, want false", failTrace["ok"])
+	}
+	if failTrace["error"] != failure {
+		t.Fatalf("trace.error = %v, want %q", failTrace["error"], failure)
+	}
+	if failTrace["at"] != float64(1700000900) {
+		t.Fatalf("trace.at = %v, want 1700000900", failTrace["at"])
+	}
+
+	// Nunca observada: la clave `trace` ausente es la que significa "no sé".
+	if tr, hasTrace := got[2]["trace"]; hasTrace {
+		t.Fatalf("third exit carries trace = %v, want the key absent when never attempted", tr)
+	}
+}
+
 // TestHealthKeepsTheStringExits is the contract guard against a future cleanup:
 // the relay parses this exact shape, so /health must keep publishing []string.
 func TestHealthKeepsTheStringExits(t *testing.T) {

@@ -47,6 +47,40 @@ type egressObservation struct {
 	ip         string
 	family     string
 	observedAt time.Time
+	// traceErr es el error del ÚLTIMO intento de trace fallido; vacío después de
+	// uno exitoso. traceAt es cuándo ocurrió ese intento, zero si nunca hubo uno.
+	traceErr string
+	traceAt  time.Time
+}
+
+// TraceFact publica el resultado del último intento de trace de una exit: el
+// plano de control necesita saber POR QUÉ una exit no tiene IP, no sólo que no
+// la tiene.
+type TraceFact struct {
+	OK bool `json:"ok"`
+	// Error se omite cuando el trace funcionó: un `error:""` obligaría al
+	// consumidor a distinguir vacío de ausente sin necesidad.
+	Error string `json:"error,omitempty"`
+	// At es epoch absoluto del intento, 0 si nunca se intentó.
+	At int64 `json:"at"`
+}
+
+// traceFact devuelve el resultado del último intento de trace, leído de la
+// cache. Es de sólo lectura a propósito: publicar hechos no puede costar un
+// handshake TLS por request. El segundo valor es false cuando nunca se intentó,
+// y en ese caso el campo `trace` se omite del JSON: ausencia = "no sé".
+func (e *Exit) traceFact() (TraceFact, bool) {
+	e.obsMu.Lock()
+	defer e.obsMu.Unlock()
+
+	if e.obs.traceAt.IsZero() {
+		return TraceFact{}, false
+	}
+	return TraceFact{
+		OK:    e.obs.traceErr == "",
+		Error: e.obs.traceErr,
+		At:    epochSec(e.obs.traceAt),
+	}, true
 }
 
 // ExitFact son los hechos propios de una exit, con epoch absoluto.
@@ -55,16 +89,17 @@ type egressObservation struct {
 // faltar: si el trace falla y no hay cache, quedan ausentes y el resto se
 // reporta igual. El plano de control decide qué hacer sin IP; warp-minimal no.
 type ExitFact struct {
-	ID            string `json:"id"`
-	State         string `json:"state"`
-	Served        int64  `json:"served"`
-	Streams       int    `json:"streams"`
-	CreatedAt     int64  `json:"created_at"`
-	CooldownUntil int64  `json:"cooldown_until"`
-	InUseSince    int64  `json:"in_use_since"`
-	IP            string `json:"ip,omitempty"`
-	Family        string `json:"family,omitempty"`
-	ObservedAt    int64  `json:"observed_at,omitempty"`
+	ID            string     `json:"id"`
+	State         string     `json:"state"`
+	Served        int64      `json:"served"`
+	Streams       int        `json:"streams"`
+	CreatedAt     int64      `json:"created_at"`
+	CooldownUntil int64      `json:"cooldown_until"`
+	InUseSince    int64      `json:"in_use_since"`
+	IP            string     `json:"ip,omitempty"`
+	Family        string     `json:"family,omitempty"`
+	ObservedAt    int64      `json:"observed_at,omitempty"`
+	Trace         *TraceFact `json:"trace,omitempty"`
 }
 
 // epochSec convierte a epoch absoluto. Zero significa "no aplica", no 1970: el
@@ -191,8 +226,15 @@ func (e *Exit) observeEgressIP(ctx context.Context, dial func(context.Context, s
 	defer cancel()
 
 	ip, err = traceEgressIP(ctx, dial)
+	// El intento cuenta aunque falle: si sólo se guardara el éxito, un trace
+	// roto sería indistinguible de uno que nunca se intentó.
+	attemptedAt := time.Now()
+	e.obs.traceAt = attemptedAt
 	if err != nil {
 		log.Printf("egress trace failed on exit %s: %v", e.ID, err)
+		// El error se guarda como hecho (D6): es lo que el plano de control
+		// necesita para saber por qué no hay IP.
+		e.obs.traceErr = err.Error()
 		// Servir el último valor conocido antes que dejar al plano de control sin
 		// dato: una IP vieja es accionable, un agujero no.
 		if !e.obs.observedAt.IsZero() {
@@ -201,7 +243,12 @@ func (e *Exit) observeEgressIP(ctx context.Context, dial func(context.Context, s
 		return "", "", time.Time{}, err
 	}
 
-	e.obs = egressObservation{ip: ip, family: ipFamily(ip), observedAt: time.Now()}
+	// Un trace exitoso limpia el error anterior: `trace.ok` describe el último
+	// intento, no el peor de la historia.
+	e.obs.ip = ip
+	e.obs.family = ipFamily(ip)
+	e.obs.observedAt = attemptedAt
+	e.obs.traceErr = ""
 	return e.obs.ip, e.obs.family, e.obs.observedAt, nil
 }
 
@@ -244,6 +291,11 @@ func (p *Pool) ExitFacts(ctx context.Context) []ExitFact {
 			out[i].Family = family
 			out[i].ObservedAt = epochSec(at)
 		}
+		// traceFact lee la cache (obsMu), nunca dispara un trace: se arma fuera de
+		// Pool.mu y DESPUÉS de observar, así describe el mismo intento que la IP.
+		if tr, ok := pr.e.traceFact(); ok {
+			out[i].Trace = &tr
+		}
 	}
 	return out
 }
@@ -271,6 +323,9 @@ func (p *Pool) ExitFact(ctx context.Context, id string) (ExitFact, bool) {
 		f.IP = ip
 		f.Family = family
 		f.ObservedAt = epochSec(at)
+	}
+	if tr, ok := target.traceFact(); ok {
+		f.Trace = &tr
 	}
 	return f, true
 }
