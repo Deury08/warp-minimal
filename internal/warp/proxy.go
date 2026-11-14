@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,49 @@ func failExit(pool failable, exit EgressDialer, reason string) {
 	if pool != nil {
 		pool.Fail(exit, reason)
 	}
+}
+
+// preferable es la capacidad opcional de elegir un exit concreto por id.
+// Sólo el pool MASQUE la expone; el pool WireGuard no la implementa.
+type preferable interface {
+	AcquirePrefer(ctx context.Context, id string) (EgressDialer, error)
+}
+
+// requestedExitID devuelve el exit que el cliente pidió, si lo hay.
+//
+// El canal es Proxy-Authorization: Basic base64("<exit-id>:"): el id viaja como
+// USUARIO y el password se ignora. No puede ser un header normal de la request:
+// en CONNECT el proxy sólo ve la request de túnel, y los headers del request
+// real viajan cifrados adentro del TLS que él mismo reenvía, así que un header
+// custom nunca llega hasta acá.
+func requestedExitID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	h := r.Header.Get("Proxy-Authorization")
+	const scheme = "Basic "
+	if len(h) < len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
+		return ""
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(h[len(scheme):]))
+	if err != nil {
+		return ""
+	}
+	user, _, _ := strings.Cut(string(raw), ":")
+	return user
+}
+
+// acquireExit honra la preferencia del cliente cuando el pool la soporta.
+// Silencioso por contrato: un id desconocido, no usable, o un stack que no
+// soporta preferencia cae en la elección normal del pool, sin error y sin 407.
+// El password de Basic auth no se valida nunca: acá no hay autenticación.
+func acquireExit(ctx context.Context, pool EgressPool, r *http.Request) (EgressDialer, error) {
+	if id := requestedExitID(r); id != "" {
+		if p, ok := pool.(preferable); ok {
+			return p.AcquirePrefer(ctx, id)
+		}
+	}
+	return pool.Acquire(ctx)
 }
 
 // egressExitID devuelve el identificador del exit para diagnósticos.
@@ -84,6 +128,14 @@ func (a masquePoolEgress) Acquire(ctx context.Context) (EgressDialer, error) {
 	return a.pool.Acquire(ctx)
 }
 
+func (a masquePoolEgress) AcquirePrefer(ctx context.Context, id string) (EgressDialer, error) {
+	e, err := a.pool.AcquirePrefer(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
 func (a masquePoolEgress) Release(exit EgressDialer) {
 	if e, ok := exit.(*Exit); ok {
 		a.pool.Release(e)
@@ -122,7 +174,7 @@ func ProxyHandlerEgress(pool EgressPool) http.HandlerFunc {
 			return
 		}
 
-		exit, err := pool.Acquire(ctx)
+		exit, err := acquireExit(ctx, pool, r)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("WARP unavailable: %v", err), http.StatusServiceUnavailable)
 			return
@@ -146,7 +198,7 @@ type servedNoter interface{ noteServed() }
 func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, failer failable) {
 	ctx := r.Context()
 
-	exit, err := pool.Acquire(ctx)
+	exit, err := acquireExit(ctx, pool, r)
 	if err != nil {
 		log.Printf("CONNECT (no host): acquire failed: %v", err)
 		http.Error(w, fmt.Sprintf("WARP unavailable: %v", err), http.StatusServiceUnavailable)
@@ -262,6 +314,10 @@ func handleConnect(w http.ResponseWriter, r *http.Request, pool EgressPool, fail
 	conn.Close()
 }
 
+// warpExitHeader atribuye una respuesta al exit que dialeó ese request. En
+// CONNECT viaja en el reply del túnel; en HTTP plano lo agrega el proxy.
+const warpExitHeader = "X-Warp-Exit"
+
 // proxyRequest reenvía un único request HTTP a través de un exit WARP.
 func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, exit EgressDialer) error {
 	host := r.URL.Host
@@ -280,9 +336,9 @@ func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, e
 	defer conn.Close()
 
 	if r.URL.Scheme == "https" || r.TLS != nil {
-		return proxyHTTPS(ctx, conn, r, w)
+		return proxyHTTPS(ctx, conn, r, w, exit)
 	}
-	return proxyHTTP(conn, r, w)
+	return proxyHTTP(conn, r, w, exit)
 }
 
 // bunClientHelloSpec devuelve el ClientHelloSpec de uTLS mimificando Bun (JA4 t13d1713h1).
@@ -332,7 +388,7 @@ func bunClientHelloSpec() *utls.ClientHelloSpec {
 }
 
 // proxyHTTPS realiza proxy HTTPS a través del exit WireGuard usando uTLS.
-func proxyHTTPS(ctx context.Context, conn net.Conn, r *http.Request, w http.ResponseWriter) error {
+func proxyHTTPS(ctx context.Context, conn net.Conn, r *http.Request, w http.ResponseWriter, exit EgressDialer) error {
 	tlsConn := utls.UClient(conn, &utls.Config{
 		ServerName:         r.URL.Hostname(),
 		NextProtos:         []string{"http/1.1"},
@@ -371,6 +427,9 @@ func proxyHTTPS(ctx context.Context, conn net.Conn, r *http.Request, w http.Resp
 	defer resp.Body.Close()
 
 	copyHeaders(w.Header(), resp.Header)
+	// Set DESPUÉS de copyHeaders: si el origin manda el suyo, gana el hecho del
+	// proxy, que es el que realmente dialeó este request.
+	w.Header().Set(warpExitHeader, egressExitID(exit))
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		return fmt.Errorf("relay response body: %w", err)
@@ -379,7 +438,7 @@ func proxyHTTPS(ctx context.Context, conn net.Conn, r *http.Request, w http.Resp
 }
 
 // proxyHTTP reenvía un request HTTP plano a través del exit WireGuard.
-func proxyHTTP(conn net.Conn, r *http.Request, w http.ResponseWriter) error {
+func proxyHTTP(conn net.Conn, r *http.Request, w http.ResponseWriter, exit EgressDialer) error {
 	req := cloneRequest(r)
 	if err := req.Write(conn); err != nil {
 		return fmt.Errorf("write request: %w", err)
@@ -392,6 +451,7 @@ func proxyHTTP(conn net.Conn, r *http.Request, w http.ResponseWriter) error {
 	defer resp.Body.Close()
 
 	copyHeaders(w.Header(), resp.Header)
+	w.Header().Set(warpExitHeader, egressExitID(exit))
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		return fmt.Errorf("relay response body: %w", err)

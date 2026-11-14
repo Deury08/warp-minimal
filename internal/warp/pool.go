@@ -145,6 +145,29 @@ func (p *Pool) Acquire(ctx context.Context) (*Exit, error) {
 	return nil, fmt.Errorf("no WARP exit available (all cooling down or starting)")
 }
 
+// AcquirePrefer devuelve el exit con ese ID si existe y es usable. Un id
+// desconocido, draining o en cooldown cae en Acquire — misma rama, sin error:
+// el caller pidió una preferencia, no una garantía, y quedarse sin salida por
+// un id viejo sería peor que servirlo por otra.
+func (p *Pool) AcquirePrefer(ctx context.Context, id string) (*Exit, error) {
+	p.mu.Lock()
+	for _, e := range p.exits {
+		if e.ID != id {
+			continue
+		}
+		// Mismo criterio de usabilidad que Acquire, sin repetir la búsqueda.
+		if !e.draining && e.Cooldown.IsZero() && e.Tunnel() != nil {
+			e.streams++
+			e.InUseSince = time.Now()
+			p.mu.Unlock()
+			return e, nil
+		}
+		break
+	}
+	p.mu.Unlock()
+	return p.Acquire(ctx)
+}
+
 func (p *Pool) Release(exit *Exit) {
 	if exit == nil {
 		return
@@ -584,27 +607,37 @@ func (p *Pool) Status() map[string]any {
 	return p.statusLocked()
 }
 
+// stateLocked nombra el estado de la exit. Debe llamarse con Pool.mu tomado.
+//
+// Los valores son parte del contrato con el plano de control, que los mapea sin
+// traducir, y coinciden con los que siempre viajaron embebidos en /health.
+func (e *Exit) stateLocked() string {
+	switch {
+	// draining va primero: un swap en vuelo es el hecho dominante, y el consumidor
+	// infiere "swap en progreso" de este estado. Si el túnel de la exit drenante
+	// muere a mitad del swap, cooldown no debe taparlo.
+	case e.draining:
+		return "draining"
+	case !e.Cooldown.IsZero():
+		return "cooldown"
+	case e.Tunnel() == nil:
+		return "starting"
+	case e.streams > 0:
+		return "in_use"
+	}
+	return "healthy"
+}
+
+// statusLocked arma el estado del pool. Debe llamarse con p.mu ya tomado.
 func (p *Pool) statusLocked() map[string]any {
 	// MUST be called with p.mu already held. Do not lock here.
 	exits := make([]string, len(p.exits))
 	for i, e := range p.exits {
-		status := "healthy"
-		streams := e.streams
-		served := e.servedCount()
-		switch {
-		// draining goes first: a swap in flight is the dominant fact, and the
-		// consumer infers "swap in progress" from this state. If the draining
-		// exit's tunnel dies mid-swap, cooldown must not hide it.
-		case e.draining:
-			status = "draining"
-		case !e.Cooldown.IsZero():
-			status = "cooldown"
-		case e.Tunnel() == nil:
-			status = "starting"
-		case streams > 0:
-			status = "in_use"
-		}
-		exits[i] = fmt.Sprintf("%s (%s, served=%d, streams=%d)", e.ID, status, served, streams)
+		// Formato INTACTO y por contrato: el plano de control lo parsea
+		// (relay.mjs warpExitSnapshot) y de él salen la atribución por served y
+		// la detección de rotación. La versión estructurada vive en GET /exits;
+		// no cambiar esta forma.
+		exits[i] = fmt.Sprintf("%s (%s, served=%d, streams=%d)", e.ID, e.stateLocked(), e.servedCount(), e.streams)
 	}
 
 	return map[string]any{

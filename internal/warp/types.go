@@ -3,6 +3,7 @@ package warp
 import (
 	"context"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -29,6 +30,11 @@ type Exit struct {
 	served int64
 	InUseSince time.Time
 	tunnel     *Tunnel
+
+	// obs cachea el último trace de egreso de ESTA exit y obsMu serializa el
+	// trace sobre ella: ver ObserveEgressIP. Nunca se toma con Pool.mu tomado.
+	obsMu sync.Mutex
+	obs   egressObservation
 }
 
 func (e *Exit) Tunnel() *Tunnel {
