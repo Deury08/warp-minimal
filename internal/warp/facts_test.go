@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -242,6 +243,120 @@ func TestFactLockedUsesAbsoluteEpochAndZeroForUnset(t *testing.T) {
 	}
 	if f.ID != "warp-facts" {
 		t.Fatalf("id = %q, want warp-facts", f.ID)
+	}
+}
+
+// TestTraceFactIsAbsentWhenNoAttemptWasMade pins the absence semantics: no
+// attempt ever made means no `trace` key, because absence keeps reading "no sé".
+func TestTraceFactIsAbsentWhenNoAttemptWasMade(t *testing.T) {
+	e := &Exit{ID: "warp-untraced"}
+	if tr, ok := e.traceFact(); ok {
+		t.Fatalf("traceFact = %+v, want absent on an exit that was never traced", tr)
+	}
+
+	p := &Pool{exits: []*Exit{e}}
+	facts := p.ExitFacts(context.Background())
+	if len(facts) != 1 {
+		t.Fatalf("facts = %d, want 1", len(facts))
+	}
+	if facts[0].Trace != nil {
+		t.Fatalf("trace = %+v, want a nil field so it is omitted from JSON", facts[0].Trace)
+	}
+}
+
+// TestObserveEgressIPRecordsTheTraceError pins D6: the trace error is kept, not
+// thrown away, and a later success clears it.
+func TestObserveEgressIPRecordsTheTraceError(t *testing.T) {
+	e := &Exit{ID: "warp-trace-error"}
+	srv := tlsTraceServer(t, traceText)
+
+	if _, _, _, err := e.observeEgressIP(context.Background(), dialTo(srv)); err != nil {
+		t.Fatalf("prime the cache: %v", err)
+	}
+	tr, ok := e.traceFact()
+	if !ok {
+		t.Fatal("traceFact absent after a successful trace")
+	}
+	if !tr.OK || tr.Error != "" || tr.At == 0 {
+		t.Fatalf("after a successful trace: %+v, want ok=true, no error, at>0", tr)
+	}
+
+	// Force the cache stale, then break the transport.
+	e.obsMu.Lock()
+	e.obs.observedAt = time.Now().Add(-2 * traceCacheTTL)
+	e.obsMu.Unlock()
+	srv.Close()
+
+	failDial := func(context.Context, string, string) (net.Conn, error) { return nil, fmt.Errorf("boom") }
+	if _, _, _, err := e.observeEgressIP(context.Background(), failDial); err == nil {
+		t.Fatal("a failed trace must still return the error")
+	}
+	tr, ok = e.traceFact()
+	if !ok {
+		t.Fatal("traceFact absent after a failed attempt: the failure is the fact worth publishing")
+	}
+	if tr.OK {
+		t.Fatal("trace.ok = true after a failed attempt")
+	}
+	if !strings.Contains(tr.Error, "boom") {
+		t.Fatalf("trace.error = %q, want the trace failure detail", tr.Error)
+	}
+	if tr.At == 0 {
+		t.Fatal("trace.at = 0 after an attempt, want the attempt time")
+	}
+
+	// A successful trace clears the error.
+	if _, _, _, err := e.observeEgressIP(context.Background(), dialTo(tlsTraceServer(t, traceText))); err != nil {
+		t.Fatalf("successful retry: %v", err)
+	}
+	tr, _ = e.traceFact()
+	if !tr.OK || tr.Error != "" {
+		t.Fatalf("after a successful retry: %+v, want the error cleared", tr)
+	}
+}
+
+// TestExitFactsReadsTheTraceFromTheCache pins that publishing the trace never
+// costs a TLS handshake: the value comes from the 45s cache.
+func TestExitFactsReadsTheTraceFromTheCache(t *testing.T) {
+	srv := tlsTraceServer(t, traceText)
+	dials := 0
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dials++
+		return dialTo(srv)(ctx, network, addr)
+	}
+
+	// No Tunnel on purpose: if reading a fact dialled, this exit could not.
+	e := &Exit{ID: "warp-cached-trace"}
+	if _, _, _, err := e.observeEgressIP(context.Background(), dial); err != nil {
+		t.Fatalf("prime the cache: %v", err)
+	}
+	if dials != 1 {
+		t.Fatalf("dials = %d while priming, want 1", dials)
+	}
+
+	p := &Pool{exits: []*Exit{e}}
+	facts := p.ExitFacts(context.Background())
+	one, found := p.ExitFact(context.Background(), "warp-cached-trace")
+
+	if dials != 1 {
+		t.Fatalf("dials = %d after reading facts inside the TTL, want 1: a fact read must never force a trace", dials)
+	}
+	if !found {
+		t.Fatal("ExitFact did not find the exit")
+	}
+	for name, f := range map[string]ExitFact{"ExitFacts": facts[0], "ExitFact": one} {
+		if f.IP != "2606:4700:10::6816:1a1a" {
+			t.Fatalf("%s ip = %q, want the cached egress IP", name, f.IP)
+		}
+		if f.Trace == nil {
+			t.Fatalf("%s trace absent, want the cached trace result", name)
+		}
+		if !f.Trace.OK || f.Trace.Error != "" {
+			t.Fatalf("%s trace = %+v, want ok=true with no error", name, *f.Trace)
+		}
+		if f.Trace.At != f.ObservedAt || f.Trace.At == 0 {
+			t.Fatalf("%s trace.at = %d vs observed_at = %d, want the same attempt epoch", name, f.Trace.At, f.ObservedAt)
+		}
 	}
 }
 
